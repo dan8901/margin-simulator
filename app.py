@@ -874,6 +874,8 @@ if "results" in st.session_state:
     )
     stretch_F_used = res["params"].get("stretch_F", 1.0)
     calib_data = []
+    any_meta = any(c["spec"]["kind"] == "meta_recal"
+                   for c in res["calibrated"].values())
     for name, c in res["calibrated"].items():
         row = {
             "Strategy": name,
@@ -884,6 +886,12 @@ if "results" in st.session_state:
         if stretch_F_used > 1.0 and c.get("T_stress") is not None:
             row[f"T_stress (F={stretch_F_used:.2f})"] = f"{c['T_stress']:.3f}x"
         row["T_recommended"] = f"{c['T_rec']:.3f}x"
+        if any_meta:
+            # Only meta_recal's choice is informative; other rows are blank.
+            if c["spec"]["kind"] == "meta_recal":
+                row["Init base"] = c.get("init_base_kind") or ""
+            else:
+                row["Init base"] = ""
         calib_data.append(row)
     st.dataframe(pd.DataFrame(calib_data), hide_index=True, use_container_width=True)
     if stretch_F_used > 1.0:
