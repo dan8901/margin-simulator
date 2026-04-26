@@ -961,7 +961,7 @@ the recal trajectory:
 | `recal_static` | `static` |
 | `recal_hybrid` | `hybrid` |
 | `recal_adaptive_dd` | `adaptive_dd` |
-| `meta_recal` | `argmax(T_rec)` over `{static, dd_decay, adaptive_dd, hybrid}` |
+| `meta_recal` | `argmax(p50 real terminal wealth)` over `{static, dd_decay, adaptive_dd, hybrid}` (see "Meta_recal pick rule" below) |
 
 A new `init_strat_idx` int parameter was threaded through `_simulate_core` /
 `_simulate_core_grid` and the Python wrappers (`simulate`, `call_rate`,
@@ -969,6 +969,47 @@ A new `init_strat_idx` int parameter was threaded through `_simulate_core` /
 to the winning base kind's index in `META_KINDS = ["static", "dd_decay",
 "adaptive_dd", "hybrid"]` so the years-0-to-first-recal phase applies the
 chosen strategy's between-recal update rule.
+
+### Meta_recal pick rule: p50 real terminal wealth (not max T)
+
+A first iteration of `meta_recal` picked `argmax(T_rec)` over the four
+candidates. Empirically that just returned `static` almost always, because
+static has the highest defensible T_max — but static's "no rebalancing
+between recals" behavior wastes leverage to DCA dilution: from T=2.025x
+on $160k starting equity, after 5 years of $180k/yr DCA the leverage
+drifts to ~1.12x and stays low.
+
+Switched to `argmax(p50 real terminal wealth)` over the remaining horizon
+at each candidate's well-defended T_rec. This is the natural EV-maximizing
+choice within the safety envelope each strategy already enforces.
+
+Implementation: `compute_recal_table` now returns `(t_table, score_table)`
+where `score_table[i, j]` = p50 real terminal wealth on calibration paths
+at the cell's T_max. `compute_recal_tables_multi` returns `(t_3d, score_3d)`.
+The JIT meta_recal block uses `meta_score_tables` (passed alongside
+`t_recal_tables_meta`) for the pick. The same metric drives meta_recal's
+year-0 T_init calibration in `app.py compute()`.
+
+Empirical impact, user's primary scenario:
+
+| Base kind | T_rec | p50 terminal |
+|---|---|---|
+| static | 2.025x | $10.67M |
+| dd_decay | 1.479x | $13.02M |
+| adaptive_dd | 1.496x | **$13.19M ← winner** |
+| hybrid | 1.661x | $12.52M |
+
+Old meta_recal (argmax T): picked static @ 2.025x.
+New meta_recal (argmax score): picks adaptive_dd @ 1.496x.
+
+Adaptive_dd's lower T_init is more than offset by its active rebalancing
+between recals: it maintains levered exposure during the heavy-DCA early
+years and ends with ~24% higher median wealth than static.
+
+Note: this is an EV pick, not a tail-aware pick. If a candidate has
+higher p50 but worse p10, the new meta_recal will still pick it. Future
+work could expose the percentile as a parameter (p25 or p10 for
+risk-averse, p50 for neutral, mean for aggressive).
 
 ### Verified empirical impact (user's primary scenario)
 
