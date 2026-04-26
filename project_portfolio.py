@@ -825,7 +825,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w = T_a - (T_a - floor) * prog
+                            cand_w = T_init - (T_init - floor) * prog
                         else:
                             cand_w = floor
                         target_lev = cand_dd if cand_dd < cand_w else cand_w
@@ -985,7 +985,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                                     prog = 0.0
                                 elif prog > 1.0:
                                     prog = 1.0
-                                cand_w = T_a - (T_a - floor) * prog
+                                cand_w = T_init - (T_init - floor) * prog
                             else:
                                 cand_w = floor
                             target_lev = cand_dd if cand_dd < cand_w else cand_w
@@ -1018,7 +1018,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                                     prog = 0.0
                                 elif prog > 1.0:
                                     prog = 1.0
-                                cand_w = T_a - (T_a - floor) * prog
+                                cand_w = T_init - (T_init - floor) * prog
                             else:
                                 cand_w = floor
                             target_lev = cur_tgt[k] if cur_tgt[k] < cand_w else cand_w
@@ -1561,7 +1561,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                     prog = 0.0
                                 elif prog > 1.0:
                                     prog = 1.0
-                                cand_w = T_a - (T_a - floor) * prog
+                                cand_w = T_init - (T_init - floor) * prog
                             else:
                                 cand_w = floor
                             target_lev = cand_dd if cand_dd < cand_w else cand_w
@@ -1715,7 +1715,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                         prog = 0.0
                                     elif prog > 1.0:
                                         prog = 1.0
-                                    cand_w = T_a - (T_a - floor) * prog
+                                    cand_w = T_init - (T_init - floor) * prog
                                 else:
                                     cand_w = floor
                                 target_lev = cand_dd if cand_dd < cand_w else cand_w
@@ -1748,7 +1748,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                         prog = 0.0
                                     elif prog > 1.0:
                                         prog = 1.0
-                                    cand_w = T_a - (T_a - floor) * prog
+                                    cand_w = T_init - (T_init - floor) * prog
                                 else:
                                     cand_w = floor
                                 target_lev = cur_tgt[k, t] if cur_tgt[k, t] < cand_w else cand_w
