@@ -494,27 +494,54 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
     else:
         ret_s = None
 
+    # Map recal_X strategies to their base kind for T_init calibration.
+    # The base kind's well-defended T_rec is used as T_init for the recal
+    # simulation: at year 0, the recal strategy behaves like the plain
+    # base kind. At each recal event, lookup-table values take over.
+    BASE_KIND_FOR_RECAL = {
+        "recal_static": "static",
+        "recal_hybrid": "hybrid",
+        "recal_adaptive_dd": "adaptive_dd",
+    }
+
     calibrated = {}
     for name, spec in strategies:
         kind = spec["kind"]
         F = spec.get("F", 1.5)
-        T_hist = find_max_safe_T_grid(ret_c, tsy_c, cpi_c, kind, 0.0,
+
+        # For recal_static / recal_hybrid / recal_adaptive_dd: calibrate
+        # using the base kind, NOT the recal trajectory. The recal lookup
+        # table is well-defended per cell already; T_init equals what the
+        # plain base kind would give at year 0. The years-0-to-first-recal
+        # phase therefore behaves like the plain base.
+        # meta_recal is handled in a dedicated block below.
+        if kind in BASE_KIND_FOR_RECAL:
+            calib_kind = BASE_KIND_FOR_RECAL[kind]
+            calib_recal_kw = {}   # base kinds don't use the lookup table
+        elif kind == "meta_recal":
+            continue   # handled in the meta_recal block below
+        else:
+            calib_kind = kind
+            calib_recal_kw = recal_kw_for(name)
+
+        T_hist = find_max_safe_T_grid(ret_c, tsy_c, cpi_c, calib_kind, 0.0,
                                        C, S, T, S2, max_days, avail=avail_c, F=F,
                                        cap_real=cap_real, wealth_X=wealth_X,
-                                       **overlay_kw, **recal_kw_for(name))
-        boot_at_hist = call_rate(ret_b, tsy_b, cpi_b, kind, T_hist,
+                                       **overlay_kw, **calib_recal_kw)
+        boot_at_hist = call_rate(ret_b, tsy_b, cpi_b, calib_kind, T_hist,
                                   C, S, T, S2, max_days, F=F, cap_real=cap_real,
-                                  wealth_X=wealth_X, **overlay_kw, **recal_kw_for(name))
-        T_boot = find_max_safe_T_grid(ret_b, tsy_b, cpi_b, kind, boot_target,
+                                  wealth_X=wealth_X, **overlay_kw,
+                                  **calib_recal_kw)
+        T_boot = find_max_safe_T_grid(ret_b, tsy_b, cpi_b, calib_kind, boot_target,
                                        C, S, T, S2, max_days, F=F,
                                        cap_real=cap_real, wealth_X=wealth_X,
-                                       **overlay_kw, **recal_kw_for(name))
+                                       **overlay_kw, **calib_recal_kw)
         if ret_s is not None:
-            T_stress = find_max_safe_T_grid(ret_s, tsy_c, cpi_c, kind, 0.0,
+            T_stress = find_max_safe_T_grid(ret_s, tsy_c, cpi_c, calib_kind, 0.0,
                                              C, S, T, S2, max_days, avail=avail_c,
                                              F=F, cap_real=cap_real,
                                              wealth_X=wealth_X, **overlay_kw,
-                                             **recal_kw_for(name))
+                                             **calib_recal_kw)
         else:
             T_stress = float("inf")
         T_rec = min(T_hist, T_boot, T_stress)
@@ -522,7 +549,9 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                                 boot_at_hist=boot_at_hist,
                                 T_boot=T_boot,
                                 T_stress=T_stress if ret_s is not None else None,
-                                T_rec=T_rec)
+                                T_rec=T_rec,
+                                init_base_kind=BASE_KIND_FOR_RECAL.get(kind),
+                                init_strat_idx=0)
 
     # cpi factor per path/day (used for nominal conversion)
     cpi_factor = cpi_h / cpi_h[:, 0:1]
