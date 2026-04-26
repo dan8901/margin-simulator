@@ -739,6 +739,19 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                     target_lev = t_recal_table[e_idx, h_idx]
                     if target_lev < floor:
                         target_lev = floor
+                    # Wealth-X cap: respect user's unlever target. The
+                    # lookup T is safety-derived and doesn't know about
+                    # wealth_X; without this cap the recal lift would
+                    # over-lever past the user's wealth goal.
+                    if wealth_X > C:
+                        prog = (real_eq_d - C) / (wealth_X - C)
+                        if prog < 0.0:
+                            prog = 0.0
+                        elif prog > 1.0:
+                            prog = 1.0
+                        cand_w_cap = target_lev - (target_lev - floor) * prog
+                        if cand_w_cap < target_lev:
+                            target_lev = cand_w_cap
                 elif kind_code == 12:   # recal_hybrid
                     if is_recal_day:
                         # Lookup + state reset + T_active update
@@ -771,6 +784,16 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                         new_T = t_recal_table[e_idx, h_idx]
                         if new_T < floor:
                             new_T = floor
+                        # Wealth-X cap on the recal lift.
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            cand_w_cap = new_T - (new_T - floor) * prog
+                            if cand_w_cap < new_T:
+                                new_T = cand_w_cap
                         T_active[k] = new_T
                         hwm_eq[k] = eq
                         max_dd[k] = 0.0
@@ -829,6 +852,16 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                         new_T = t_recal_table[e_idx, h_idx]
                         if new_T < floor:
                             new_T = floor
+                        # Wealth-X cap on the recal lift.
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            cand_w_cap = new_T - (new_T - floor) * prog
+                            if cand_w_cap < new_T:
+                                new_T = cand_w_cap
                         T_active[k] = new_T
                         hwm_eq[k] = eq
                         max_dd[k] = 0.0
@@ -902,6 +935,16 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                         best_T = t_recal_tables_meta[best_s, e_idx, h_idx]
                         if best_T < floor:
                             best_T = floor
+                        # Wealth-X cap on the recal lift.
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            cand_w_cap = best_T - (best_T - floor) * prog
+                            if cand_w_cap < best_T:
+                                best_T = cand_w_cap
                         T_active[k] = best_T
                         strat_active[k] = best_s
                         hwm_eq[k] = eq
@@ -1430,6 +1473,16 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                         target_lev = t_recal_table[e_idx, h_idx]
                         if target_lev < floor:
                             target_lev = floor
+                        # Wealth-X cap on recal lift.
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            cand_w_cap = target_lev - (target_lev - floor) * prog
+                            if cand_w_cap < target_lev:
+                                target_lev = cand_w_cap
                     elif kind_code == 12:   # recal_hybrid (grid)
                         if is_recal_day:
                             real_eq_d = eq * cpi_0 / cpi_d
@@ -1461,6 +1514,16 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                             new_T = t_recal_table[e_idx, h_idx]
                             if new_T < floor:
                                 new_T = floor
+                            # Wealth-X cap on recal lift.
+                            if wealth_X > C:
+                                prog = (real_eq_d - C) / (wealth_X - C)
+                                if prog < 0.0:
+                                    prog = 0.0
+                                elif prog > 1.0:
+                                    prog = 1.0
+                                cand_w_cap = new_T - (new_T - floor) * prog
+                                if cand_w_cap < new_T:
+                                    new_T = cand_w_cap
                             T_active[k, t] = new_T
                             hwm_eq[k, t] = eq
                             max_dd[k, t] = 0.0
@@ -1518,6 +1581,16 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                             new_T = t_recal_table[e_idx, h_idx]
                             if new_T < floor:
                                 new_T = floor
+                            # Wealth-X cap on recal lift.
+                            if wealth_X > C:
+                                prog = (real_eq_d - C) / (wealth_X - C)
+                                if prog < 0.0:
+                                    prog = 0.0
+                                elif prog > 1.0:
+                                    prog = 1.0
+                                cand_w_cap = new_T - (new_T - floor) * prog
+                                if cand_w_cap < new_T:
+                                    new_T = cand_w_cap
                             T_active[k, t] = new_T
                             hwm_eq[k, t] = eq
                             max_dd[k, t] = 0.0
@@ -1587,6 +1660,16 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                             best_T = t_recal_tables_meta[best_s, e_idx, h_idx]
                             if best_T < floor:
                                 best_T = floor
+                            # Wealth-X cap on recal lift.
+                            if wealth_X > C:
+                                prog = (real_eq_d - C) / (wealth_X - C)
+                                if prog < 0.0:
+                                    prog = 0.0
+                                elif prog > 1.0:
+                                    prog = 1.0
+                                cand_w_cap = best_T - (best_T - floor) * prog
+                                if cand_w_cap < best_T:
+                                    best_T = cand_w_cap
                             T_active[k, t] = best_T
                             strat_active[k, t] = best_s
                             hwm_eq[k, t] = eq
