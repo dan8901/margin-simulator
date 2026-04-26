@@ -1047,7 +1047,8 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                         rate_threshold, rate_factor,
                         recal_period_days, t_recal_table, e_recal_grid,
                         h_recal_grid_days,
-                        t_recal_tables_meta, meta_strategy_codes):
+                        t_recal_tables_meta, meta_strategy_codes,
+                        init_strat_idx):
     """Vectorized over T. Runs all T_inits values simultaneously, sharing the
     same per-path data. Returns `called[K, T_count]` only — skips real_eq,
     peak_lev, and leverage tracking since binary search only needs call counts.
@@ -1064,7 +1065,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
     max_w_prog = np.zeros((K, T_count))
     cur_tgt = np.empty((K, T_count))
     T_active = np.empty((K, T_count))
-    strat_active = np.zeros((K, T_count), dtype=np.int64)
+    strat_active = np.full((K, T_count), init_strat_idx, dtype=np.int64)
     called = np.zeros((K, T_count), dtype=np.bool_)
     cap_reached = np.zeros((K, T_count), dtype=np.bool_)
 
