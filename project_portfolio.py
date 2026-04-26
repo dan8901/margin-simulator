@@ -893,44 +893,15 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                         cur_tgt[k] = best_T
                         target_lev = best_T
                     else:
-                        # Apply active strategy's logic with T_active[k]
+                        # Apply active strategy's logic with T_active[k].
+                        # Candidate set is wealth-aware: {static, hybrid,
+                        # adaptive_hybrid}. dd_decay/adaptive_dd no longer
+                        # included (they don't honor wealth_X).
                         s_code = meta_strategy_codes[strat_active[k]]
                         T_a = T_active[k]
                         if s_code == 0:   # static between recals: no rebalance
                             target_lev = stocks[k] / eq if eq > 0.0 else T_a
-                        elif s_code == 2:   # dd_decay
-                            if eq > hwm_eq[k]:
-                                hwm_eq[k] = eq
-                            if hwm_eq[k] > 0.0:
-                                dd_now = 1.0 - eq / hwm_eq[k]
-                                if dd_now > max_dd[k]:
-                                    max_dd[k] = dd_now
-                            cand = T_a - F * max_dd[k]
-                            target_lev = floor if cand < floor else cand
-                        elif s_code == 9:   # adaptive_dd
-                            if eq > hwm_eq[k]:
-                                hwm_eq[k] = eq
-                            if hwm_eq[k] > 0.0:
-                                dd_now = 1.0 - eq / hwm_eq[k]
-                                if dd_now > max_dd[k]:
-                                    max_dd[k] = dd_now
-                            if eq > 0.0:
-                                L_now = stocks[k] / eq
-                            else:
-                                L_now = T_a
-                            if T_a > 1.0:
-                                F_eff = F * (L_now - 1.0) / (T_a - 1.0)
-                            else:
-                                F_eff = 0.0
-                            if F_eff < 0.0:
-                                F_eff = 0.0
-                            cand = T_a - F_eff * max_dd[k]
-                            if cand < floor:
-                                cand = floor
-                            if cand < cur_tgt[k]:
-                                cur_tgt[k] = cand
-                            target_lev = cur_tgt[k]
-                        elif s_code == 4:   # hybrid
+                        elif s_code == 4:   # hybrid (dd_decay + wealth glide)
                             if eq > hwm_eq[k]:
                                 hwm_eq[k] = eq
                             if hwm_eq[k] > 0.0:
@@ -951,6 +922,39 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                             else:
                                 cand_w = floor
                             target_lev = cand_dd if cand_dd < cand_w else cand_w
+                        elif s_code == 10:   # adaptive_hybrid (adaptive_dd + wealth glide)
+                            if eq > hwm_eq[k]:
+                                hwm_eq[k] = eq
+                            if hwm_eq[k] > 0.0:
+                                dd_now = 1.0 - eq / hwm_eq[k]
+                                if dd_now > max_dd[k]:
+                                    max_dd[k] = dd_now
+                            if eq > 0.0:
+                                L_now = stocks[k] / eq
+                            else:
+                                L_now = T_a
+                            if T_a > 1.0:
+                                F_eff = F * (L_now - 1.0) / (T_a - 1.0)
+                            else:
+                                F_eff = 0.0
+                            if F_eff < 0.0:
+                                F_eff = 0.0
+                            cand_dd = T_a - F_eff * max_dd[k]
+                            if cand_dd < floor:
+                                cand_dd = floor
+                            if cand_dd < cur_tgt[k]:
+                                cur_tgt[k] = cand_dd
+                            real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                            if wealth_X > C:
+                                prog = (real_eq_d - C) / (wealth_X - C)
+                                if prog < 0.0:
+                                    prog = 0.0
+                                elif prog > 1.0:
+                                    prog = 1.0
+                                cand_w = T_a - (T_a - floor) * prog
+                            else:
+                                cand_w = floor
+                            target_lev = cur_tgt[k] if cur_tgt[k] < cand_w else cand_w
                         else:
                             target_lev = T_a
                 else:
@@ -1574,43 +1578,13 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                             cur_tgt[k, t] = best_T
                             target_lev = best_T
                         else:
+                            # Wealth-aware candidate set: {static, hybrid,
+                            # adaptive_hybrid}.
                             s_code = meta_strategy_codes[strat_active[k, t]]
                             T_a = T_active[k, t]
                             if s_code == 0:
                                 target_lev = stocks[k, t] / eq if eq > 0.0 else T_a
-                            elif s_code == 2:
-                                if eq > hwm_eq[k, t]:
-                                    hwm_eq[k, t] = eq
-                                if hwm_eq[k, t] > 0.0:
-                                    dd_now = 1.0 - eq / hwm_eq[k, t]
-                                    if dd_now > max_dd[k, t]:
-                                        max_dd[k, t] = dd_now
-                                cand = T_a - F * max_dd[k, t]
-                                target_lev = floor if cand < floor else cand
-                            elif s_code == 9:
-                                if eq > hwm_eq[k, t]:
-                                    hwm_eq[k, t] = eq
-                                if hwm_eq[k, t] > 0.0:
-                                    dd_now = 1.0 - eq / hwm_eq[k, t]
-                                    if dd_now > max_dd[k, t]:
-                                        max_dd[k, t] = dd_now
-                                if eq > 0.0:
-                                    L_now = stocks[k, t] / eq
-                                else:
-                                    L_now = T_a
-                                if T_a > 1.0:
-                                    F_eff = F * (L_now - 1.0) / (T_a - 1.0)
-                                else:
-                                    F_eff = 0.0
-                                if F_eff < 0.0:
-                                    F_eff = 0.0
-                                cand = T_a - F_eff * max_dd[k, t]
-                                if cand < floor:
-                                    cand = floor
-                                if cand < cur_tgt[k, t]:
-                                    cur_tgt[k, t] = cand
-                                target_lev = cur_tgt[k, t]
-                            elif s_code == 4:
+                            elif s_code == 4:   # hybrid
                                 if eq > hwm_eq[k, t]:
                                     hwm_eq[k, t] = eq
                                 if hwm_eq[k, t] > 0.0:
@@ -1631,6 +1605,39 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                 else:
                                     cand_w = floor
                                 target_lev = cand_dd if cand_dd < cand_w else cand_w
+                            elif s_code == 10:   # adaptive_hybrid
+                                if eq > hwm_eq[k, t]:
+                                    hwm_eq[k, t] = eq
+                                if hwm_eq[k, t] > 0.0:
+                                    dd_now = 1.0 - eq / hwm_eq[k, t]
+                                    if dd_now > max_dd[k, t]:
+                                        max_dd[k, t] = dd_now
+                                if eq > 0.0:
+                                    L_now = stocks[k, t] / eq
+                                else:
+                                    L_now = T_a
+                                if T_a > 1.0:
+                                    F_eff = F * (L_now - 1.0) / (T_a - 1.0)
+                                else:
+                                    F_eff = 0.0
+                                if F_eff < 0.0:
+                                    F_eff = 0.0
+                                cand_dd = T_a - F_eff * max_dd[k, t]
+                                if cand_dd < floor:
+                                    cand_dd = floor
+                                if cand_dd < cur_tgt[k, t]:
+                                    cur_tgt[k, t] = cand_dd
+                                real_eq_d = eq * cpi_0 / cpi_d
+                                if wealth_X > C:
+                                    prog = (real_eq_d - C) / (wealth_X - C)
+                                    if prog < 0.0:
+                                        prog = 0.0
+                                    elif prog > 1.0:
+                                        prog = 1.0
+                                    cand_w = T_a - (T_a - floor) * prog
+                                else:
+                                    cand_w = floor
+                                target_lev = cur_tgt[k, t] if cur_tgt[k, t] < cand_w else cand_w
                             else:
                                 target_lev = T_a
                     else:

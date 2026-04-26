@@ -66,16 +66,17 @@ def calibrate_base(kind):
     return T_rec, score
 
 
-# Plain base calibrations
+# Plain base calibrations. recal_adaptive_dd uses adaptive_dd as base
+# even though adaptive_dd isn't a meta_recal candidate anymore.
+all_kinds = ["static", "hybrid", "adaptive_hybrid", "adaptive_dd"]
 results = {}
-for kind in ["static", "hybrid", "adaptive_dd", "dd_decay"]:
+for kind in all_kinds:
     T_rec, score = calibrate_base(kind)
     results[kind] = dict(T_rec=T_rec, score=score)
 
 T_static = results["static"]["T_rec"]
 T_hybrid = results["hybrid"]["T_rec"]
 T_adaptive = results["adaptive_dd"]["T_rec"]
-T_dd = results["dd_decay"]["T_rec"]
 
 # Replicate compute()'s recal calibration logic:
 # For recal_X strategies, T_rec is just the corresponding base T_rec
@@ -85,8 +86,8 @@ recal_T = {
     "recal_adaptive_dd": T_adaptive,
 }
 
-# meta_recal: argmax(score) over the four base candidates in fixed order
-META_KINDS = ["static", "dd_decay", "adaptive_dd", "hybrid"]
+# meta_recal: argmax(score) over wealth-aware candidates only
+META_KINDS = ["static", "hybrid", "adaptive_hybrid"]
 scores = [results[k]["score"] for k in META_KINDS]
 T_recs_meta = [results[k]["T_rec"] for k in META_KINDS]
 winner_idx = int(np.argmax(scores))
@@ -95,9 +96,10 @@ T_meta = T_recs_meta[winner_idx]
 
 # Print summary
 print("Plain base calibration:")
-for k in META_KINDS:
+for k in all_kinds:
     r = results[k]
-    print(f"  {k:14s}  T_rec={r['T_rec']:.4f}x  p50_terminal=${r['score']:>14,.0f}")
+    in_meta = " (meta candidate)" if k in META_KINDS else ""
+    print(f"  {k:16s}  T_rec={r['T_rec']:.4f}x  p50_terminal=${r['score']:>14,.0f}{in_meta}")
 print()
 print("Recal T_rec (post-fix expected):")
 print(f"  recal_static       = {recal_T['recal_static']:.4f}x")

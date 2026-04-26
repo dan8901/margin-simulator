@@ -398,7 +398,10 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         rate_factor=rate_factor,
     )
 
-    # Identify which strategies need which lookup tables
+    # Identify which strategies need which lookup tables.
+    # meta_recal candidates are wealth-aware bases only: {static, hybrid,
+    # adaptive_hybrid}. Static deleverages passively via DCA dilution;
+    # the other two enforce wealth_X via their internal glide.
     recal_strategies_needed = set()
     for name in strategies_tuple:
         if name == "recal_static":
@@ -408,7 +411,7 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         elif name == "recal_adaptive_dd":
             recal_strategies_needed.add("adaptive_dd")
         elif name == "meta_recal":
-            for s in ("static", "dd_decay", "adaptive_dd", "hybrid"):
+            for s in ("static", "hybrid", "adaptive_hybrid"):
                 recal_strategies_needed.add(s)
     needs_meta = "meta_recal" in strategies_tuple
 
@@ -446,13 +449,14 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                 ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b,
                 boot_target=boot_target,
                 ret_s=ret_s_for_recal, stretch_F=stretch_F)
-        # Build 3D meta tables if needed (fixed order static / dd_decay / adaptive_dd / hybrid)
+        # Build 3D meta tables if needed (fixed order static / hybrid / adaptive_hybrid).
+        # Wealth-aware candidates only — see recal_strategies_needed comment above.
         if needs_meta:
-            meta_kinds = ["static", "dd_decay", "adaptive_dd", "hybrid"]
+            meta_kinds = ["static", "hybrid", "adaptive_hybrid"]
             t_recal_tables_meta = np.stack([per_strat_tables[k][0] for k in meta_kinds])
             meta_score_tables = np.stack([per_strat_tables[k][1] for k in meta_kinds])
             meta_strategy_codes = np.array(
-                [{"static": 0, "dd_decay": 2, "adaptive_dd": 9, "hybrid": 4}[k]
+                [{"static": 0, "hybrid": 4, "adaptive_hybrid": 10}[k]
                  for k in meta_kinds], dtype=np.int64)
         else:
             t_recal_tables_meta = np.zeros((1, 1, 1), dtype=np.float64)
@@ -560,11 +564,14 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                                 init_base_kind=BASE_KIND_FOR_RECAL.get(kind),
                                 init_strat_idx=0)
 
-    # meta_recal: calibrate all four base candidates and pick the candidate
-    # with the highest expected p50 real terminal wealth (NOT highest T).
-    # The winner's index in META_KINDS becomes init_strat_idx so the
-    # years-before-first-recal phase applies the chosen strategy's logic.
-    META_KINDS = ["static", "dd_decay", "adaptive_dd", "hybrid"]   # MUST match the meta_kinds ordering above
+    # meta_recal: calibrate all wealth-aware base candidates and pick the
+    # candidate with the highest expected p50 real terminal wealth (NOT
+    # highest T). The winner's index in META_KINDS becomes init_strat_idx
+    # so the years-before-first-recal phase applies the chosen strategy's
+    # logic. dd_decay/adaptive_dd are NOT in this set because they don't
+    # honor wealth_X; static deleverages passively, hybrid/adaptive_hybrid
+    # via internal wealth glide.
+    META_KINDS = ["static", "hybrid", "adaptive_hybrid"]   # MUST match the meta_kinds ordering above
     meta_strategies = [(n, s) for n, s in strategies if s["kind"] == "meta_recal"]
     for name, spec in meta_strategies:
         F = spec.get("F", 1.5)
