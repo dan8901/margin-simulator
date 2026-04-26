@@ -364,7 +364,8 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                    rate_threshold, rate_factor,
                    recal_period_days, t_recal_table, e_recal_grid,
                    h_recal_grid_days,
-                   t_recal_tables_meta, meta_strategy_codes):
+                   t_recal_tables_meta, meta_strategy_codes,
+                   init_strat_idx):
     """JIT-compiled per-day, per-path inner loop. Avoids temporary array
     allocations entirely. kind_code: 0=static, 1=relever, 2=dd_decay,
     3=wealth_decay, 4=hybrid, 5=r_hybrid, 6=vol_hybrid, 7=dip_hybrid,
@@ -392,7 +393,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
     max_w_prog = np.zeros(K)   # ratcheted wealth progress (kind=5)
     cur_tgt = np.full(K, float(T_init))   # adaptive_dd monotonic ratchet
     T_active = np.full(K, float(T_init))   # per-path T_init (recal kinds 12/13/14)
-    strat_active = np.zeros(K, dtype=np.int64)   # meta_recal: index of selected strategy
+    strat_active = np.full(K, init_strat_idx, dtype=np.int64)   # meta_recal: index of selected strategy
     called = np.zeros(K, dtype=np.bool_)
     cap_reached = np.zeros(K, dtype=np.bool_)
     peak_lev = np.full(K, float(T_init))
