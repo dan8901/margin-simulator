@@ -169,7 +169,7 @@ with st.sidebar:
                  "Below C: target = T_init. Above wealth_X: target = 1.0x.")
         wealth_glide_exp = st.slider(
             "wealth_glide exponent (1=linear, 2=quadratic, 3=cubic)",
-            1.0, 3.0, 1.0, step=0.5,
+            1.0, 3.0, 2.0, step=0.5,
             help="Shape of the wealth_decay glide. exp=1 (linear) deleverages "
                  "uniformly. exp=2 (quadratic) keeps target near T_init for "
                  "low wealth and only deleverages aggressively near wealth_X "
