@@ -28,6 +28,7 @@ All scripts are self-contained: they read from `spx_margin_history.csv` (not the
 5d. [Generalization vs overfitting](#5d-generalization-vs-overfitting-added-in-third-session)
 5e. [Streamlit app + new strategy families](#5e-streamlit-app--new-strategy-families-added-in-fourth-session)
 5f. [Re-calibration strategies + meta_recal](#5f-re-calibration-strategies--meta_recal-added-in-fifth-session)
+5g. [Recal T_init calibration fix](#5g-recal-t_init-calibration-fix-added-in-sixth-session)
 6. [Practical recommendations](#6-practical-recommendations)
 7. [Caveats and limitations](#7-caveats-and-limitations)
 8. [Important corrections made during analysis](#8-important-corrections-made-during-analysis)
@@ -199,6 +200,11 @@ All scripts are standalone and runnable with `.venv/bin/python script_name.py`. 
 ### Foundation
 
 - **`data_loader.py`** — Loads the CSV, returns numpy arrays. `load()` returns 4-tuple (dates, spx, tsy, margin); `load(with_cpi=True)` returns 5-tuple appending CPI level.
+
+### Verification scripts
+
+- **`verify_recal_tinit.py`** — Computes plain well-defended T_rec for `{static, hybrid, adaptive_dd, dd_decay}` on the user's primary scenario. Used as a reference for what the recal_X strategies in `app.py` should display post-fix (see §5g). Just prints; doesn't assert.
+- **`verify_recal_end_to_end.py`** — Same calibration as above, plus assertions: recal_X T_rec == base T_rec, meta_recal T_rec == argmax. Exits non-zero on regression. Run after any change to the calibration logic in `app.py compute()` or `find_max_safe_T_grid`.
 
 ### Side / utility scripts
 
@@ -924,6 +930,90 @@ with current portfolio state and decide a fresh strategy. The
 `recal_static` / `recal_hybrid` strategies *simulate* this workflow
 algorithmically, but the real workflow is for the user to do it
 manually with up-to-date data.
+
+---
+
+## 5g. Recal T_init calibration fix (added in sixth session)
+
+Open question #1 from §5f resolved. Spec at
+`docs/superpowers/specs/2026-04-26-recal-tinit-fix-design.md`,
+implementation plan at
+`docs/superpowers/plans/2026-04-26-recal-tinit-fix.md`.
+
+### Problem
+
+Pre-fix, `find_max_safe_T_grid(kind="recal_static", ...)` ran the binary
+search over the *full 30y trajectory including all recal events*. The
+recal events themselves produce ~3% bootstrap calls at well-defended
+per-cell T_max (1% per cell, ~6 events ⇒ multi-event compounding),
+regardless of T_init. The binary search therefore bottomed out at the
+lower bound (1.0x). Result: `recal_X` strategies ran unleveraged for
+years 0 → first recal, missing the heavy-DCA early window where plain
+`static` calibrates to ~2.0x.
+
+### Fix
+
+For each recal strategy, calibrate T_init using the **base kind**, not
+the recal trajectory:
+
+| Recal strategy | Base kind for T_init |
+|---|---|
+| `recal_static` | `static` |
+| `recal_hybrid` | `hybrid` |
+| `recal_adaptive_dd` | `adaptive_dd` |
+| `meta_recal` | `argmax(T_rec)` over `{static, dd_decay, adaptive_dd, hybrid}` |
+
+A new `init_strat_idx` int parameter was threaded through `_simulate_core` /
+`_simulate_core_grid` and the Python wrappers (`simulate`, `call_rate`,
+`find_max_safe_T_grid`). For `meta_recal`, this initializes `strat_active[k]`
+to the winning base kind's index in `META_KINDS = ["static", "dd_decay",
+"adaptive_dd", "hybrid"]` so the years-0-to-first-recal phase applies the
+chosen strategy's between-recal update rule.
+
+### Verified empirical impact (user's primary scenario)
+
+`C=160k, S=180k×5y, S2=30k, X=$3M, 30y, F=1.5, stretch=1.1, boot=1%`:
+
+| Strategy | Pre-fix T_rec | Post-fix T_rec |
+|---|---|---|
+| static (plain) | 2.025x | 2.025x (unchanged) |
+| hybrid (plain) | 1.661x | 1.661x (unchanged) |
+| adaptive_dd (plain) | 1.496x | 1.496x (unchanged) |
+| dd_decay (plain) | 1.479x | 1.479x (unchanged) |
+| **recal_static** | **1.000x** | **2.025x** |
+| **recal_hybrid** | **1.000x** | **1.661x** |
+| **recal_adaptive_dd** | **1.000x** | **1.496x** |
+| **meta_recal** | **1.000x** | **2.025x (init: static)** |
+
+Recal strategies now Pareto-dominate plain strategies: identical year-0
+behavior, plus re-leveraging at year 5 / year 10 / etc. via the lookup
+table when state is favorable. Strategy-level bootstrap call rate stays
+~3% (per-cell ≤1% × ~6 recal events), accepted as the cost of
+multi-event exposure (see §5f for the cell-vs-strategy distinction).
+
+### What's still open
+
+The five other open questions from §5f are unchanged:
+
+- Option B: preserve `max_dd` ratchet across recal events
+- `recal_period_months < T_yrs` lookup-table-DCA mismatch
+- Adaptive `recal_period`
+- Joint-defended sizing (strategy-level ≤1% boot)
+- Test on different scenarios (low-DCA, longer horizon)
+
+### Verification
+
+`verify_recal_tinit.py` and `verify_recal_end_to_end.py` reproduce the
+post-fix calibration values without going through Streamlit. The end-to-end
+script asserts the four invariants and exits non-zero on regression — useful
+as a regression test for any future changes to the calibration logic.
+
+### Process notes for next session
+
+- The user prefers **option B** when faced with an entangled-history git
+  situation (multiple uncommitted changes from a prior session getting
+  swept into a focused commit). Soft-reset, split into logical units,
+  re-commit. Don't bundle unrelated work into a misnamed commit.
 
 ---
 
