@@ -1030,6 +1030,13 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                     peak_lev[k] = lev_now
             real_eq[k, d] = eq * cpi[k, 0] / cpi[k, d]
 
+            # For recal kinds, overwrite the pre-rebalance leverage capture
+            # with the POST-rebalance value so the chart visualizes the
+            # recal lift. Other kinds keep the pre-rebalance value (showing
+            # natural drift between rebalances).
+            if is_cp and kind_code >= 11 and eq > 0.0:
+                lev_at_cp[k, cp_idx] = stocks[k] / eq
+
         if is_cp:
             cp_idx += 1
 
