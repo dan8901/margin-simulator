@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtualenv
+.venv/
+venv/
+
+# Numba cache
+__pycache__/
+*.numba.cache/
+
+# Editor / OS / agent state
+.vscode/
+.idea/
+.DS_Store
+.claude/
+
+# Local-only data not used by the app
+*.xlsx
+/tmp/
+
+# Personal notes (kept local)
+thoughts.txt

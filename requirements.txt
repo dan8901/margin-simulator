@@ -1,0 +1,5 @@
+streamlit>=1.56,<2
+numpy>=2.0,<3
+pandas>=2.2,<4
+matplotlib>=3.9,<4
+numba>=0.61,<1

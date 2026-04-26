@@ -1,0 +1,830 @@
+"""
+app.py — Streamlit UI for the calibrated portfolio projection.
+
+Run with:
+    .venv/bin/streamlit run app.py
+
+Sliders in the sidebar configure the scenario. The "Run / refresh" button
+in the main pane triggers a calibration + projection cycle (~10-15 seconds
+the first time on cold paths, ~5-10 seconds afterwards once path arrays
+are cached).
+
+Path arrays (historical and bootstrap) are cached via @st.cache_resource so
+they only rebuild when the horizon or bootstrap settings change. Calibration
+re-runs on every press of the button.
+"""
+
+import time
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from data_loader import load
+from project_portfolio import (
+    TD,
+    build_bootstrap_paths,
+    build_historical_paths,
+    call_rate,
+    find_max_safe_T_grid,
+    percentiles_at,
+    simulate,
+    stretch_returns,
+)
+
+
+# ---------------------------------------------------------------------------
+# Page setup
+# ---------------------------------------------------------------------------
+
+st.set_page_config(page_title="Portfolio Projection", layout="wide")
+st.title("Leveraged portfolio projection")
+st.caption(
+    "Real-dollar projections with leverage strategies calibrated to your scenario "
+    "(historical and bootstrap-defended)."
+)
+
+
+# ---------------------------------------------------------------------------
+# Sidebar — parameters
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.header("Scenario")
+    C = st.number_input("Current portfolio C ($)", value=160_000,
+                        step=10_000, min_value=0)
+    S = st.number_input("Annual savings S ($/yr, today's $)", value=180_000,
+                        step=10_000, min_value=0)
+    T = st.slider("Years saving S (T)", 0.0, 30.0, 5.0, step=1.0)
+    S2 = st.number_input("Savings after T (S2 $/yr)", value=30_000,
+                         step=5_000, min_value=0)
+
+    st.header("Horizon")
+    max_years = st.slider("Max horizon (years)", 5, 50, 30)
+    checkpoints_str = st.text_input(
+        "Checkpoints (years, comma-separated)", "5,10,15,20,25,30")
+
+    st.header("Bootstrap")
+    n_bootstrap = st.slider("# synthetic paths", 500, 5000, 1000, step=500)
+    boot_target_pct = st.slider("Target call rate (%)", 0.5, 5.0, 1.0, step=0.5)
+    block_years = st.slider("Block size (years)", 1.0, 5.0, 1.0, step=0.5)
+    seed = st.number_input("Bootstrap seed", value=42, step=1)
+
+    st.header("Drawdown stretch")
+    stretch_F = st.slider("Drawdown stretch factor F", 1.0, 1.5, 1.0, step=0.05,
+                          help="F=1.0 = no stretch. F=1.2 = every historical "
+                               "drawdown 20% deeper. Adds a third safety bar.")
+
+    st.header("Strategies")
+    show_static = st.checkbox("static", value=True)
+    show_relever = st.checkbox("relever (monthly)", value=True)
+    show_dd = st.checkbox("dd_decay (drawdown decay)", value=True)
+    dd_F = st.slider("dd_decay F (decay factor)", 0.5, 3.0, 1.5, step=0.1,
+                     help="target = max(1.0, T_init - F × max_dd_observed). "
+                          "Higher F = more aggressive deleveraging on drawdowns.")
+
+    st.header("Display")
+    real_dollars = st.toggle("Show in real $ (today's purchasing power)", value=True,
+                             help="Off = nominal $ at each year along each path.")
+
+    st.header("Goal probabilities")
+    target_wealth_M = st.number_input("Target wealth ($M)", value=3.0, step=0.5,
+                                       min_value=0.1)
+    target_year = st.slider("Target year", 5, 30, 15)
+
+    st.header("Stop levering up at wealth")
+    cap_enabled = st.toggle("Stop adding leverage above this wealth", value=True,
+                            help="When ON, every strategy stops levering up the moment "
+                                 "real wealth crosses the threshold below. The flag is "
+                                 "permanent — it doesn't toggle off if wealth dips below "
+                                 "after crossing.")
+    cap_wealth_M = st.number_input("Stop-levering threshold (real $M)", value=3.0,
+                                    step=0.5, min_value=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Cached path builders
+# ---------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def get_paths(max_days, n_bootstrap, block_years_int, seed):
+    dates, px, tsy, mrate, cpi = load(with_cpi=True)
+    ret_c, tsy_c, cpi_c, avail_c, _ = build_historical_paths(
+        dates, px, tsy, cpi, max_days, min_days=max_days)
+    ret_h, tsy_h, cpi_h, avail_h, entry_dates_h = build_historical_paths(
+        dates, px, tsy, cpi, max_days, min_days=TD)
+    rng = np.random.default_rng(int(seed))
+    block_days = int(block_years_int / 100.0 * TD)
+    ret_b, tsy_b, cpi_b = build_bootstrap_paths(
+        dates, px, tsy, cpi, max_days, n_bootstrap, block_days, rng)
+    return dict(
+        calib=(ret_c, tsy_c, cpi_c, avail_c),
+        proj=(ret_h, tsy_h, cpi_h, avail_h, entry_dates_h),
+        boot=(ret_b, tsy_b, cpi_b),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Run controls
+# ---------------------------------------------------------------------------
+
+checkpoints = sorted(float(x.strip()) for x in checkpoints_str.split(",") if x.strip())
+max_days = int(max_years * TD)
+boot_target = boot_target_pct / 100.0
+block_years_int = int(block_years * 100)   # for the cache key
+
+col1, col2 = st.columns([1, 4])
+with col1:
+    run = st.button("Run / refresh", type="primary", use_container_width=True)
+with col2:
+    st.caption("Click to recalibrate after changing scenario or bootstrap settings.")
+
+
+def selected_strategies():
+    out = []
+    if show_static:
+        out.append(("static", dict(kind="static")))
+    if show_relever:
+        out.append(("relever", dict(kind="relever")))
+    if show_dd:
+        out.append(("dd_decay", dict(kind="dd_decay", F=dd_F, floor=1.0)))
+    return out
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
+            boot_target, stretch_F, dd_F, cap_real, _paths_key, _paths):
+    """Cached calibration + projection.
+    Cache keys on the leading scalars + tuples; `_paths` is opaque (underscore
+    tells Streamlit not to hash). `_paths_key` is the cache identity for the
+    paths dict (so cache invalidates if paths change but the underscore arg
+    can stay opaque)."""
+    # Reconstruct strategies list from hashable tuple
+    strategies = []
+    for name in strategies_tuple:
+        if name == "static":
+            strategies.append((name, dict(kind="static")))
+        elif name == "relever":
+            strategies.append((name, dict(kind="relever")))
+        elif name == "dd_decay":
+            strategies.append((name, dict(kind="dd_decay", F=dd_F, floor=1.0)))
+    checkpoints = list(checkpoints_tuple)
+
+    paths = _paths
+    ret_c, tsy_c, cpi_c, avail_c = paths["calib"]
+    ret_h, tsy_h, cpi_h, avail_h, entry_dates_h = paths["proj"]
+    ret_b, tsy_b, cpi_b = paths["boot"]
+
+    # Stretched calibration paths (only built if F > 1)
+    if stretch_F > 1.0:
+        ret_s = stretch_returns(ret_c, stretch_F)
+    else:
+        ret_s = None
+
+    calibrated = {}
+    for name, spec in strategies:
+        kind = spec["kind"]
+        F = spec.get("F", 1.5)
+        T_hist = find_max_safe_T_grid(ret_c, tsy_c, cpi_c, kind, 0.0,
+                                       C, S, T, S2, max_days, avail=avail_c, F=F,
+                                       cap_real=cap_real)
+        boot_at_hist = call_rate(ret_b, tsy_b, cpi_b, kind, T_hist,
+                                  C, S, T, S2, max_days, F=F, cap_real=cap_real)
+        T_boot = find_max_safe_T_grid(ret_b, tsy_b, cpi_b, kind, boot_target,
+                                       C, S, T, S2, max_days, F=F,
+                                       cap_real=cap_real)
+        if ret_s is not None:
+            T_stress = find_max_safe_T_grid(ret_s, tsy_c, cpi_c, kind, 0.0,
+                                             C, S, T, S2, max_days, avail=avail_c,
+                                             F=F, cap_real=cap_real)
+        else:
+            T_stress = float("inf")
+        T_rec = min(T_hist, T_boot, T_stress)
+        calibrated[name] = dict(spec=spec, T_hist=T_hist,
+                                boot_at_hist=boot_at_hist,
+                                T_boot=T_boot,
+                                T_stress=T_stress if ret_s is not None else None,
+                                T_rec=T_rec)
+
+    # cpi factor per path/day (used for nominal conversion)
+    cpi_factor = cpi_h / cpi_h[:, 0:1]
+
+    def per_checkpoint_arrays(real_eq):
+        """For each checkpoint, returns dict y -> dict(real, nominal, entry_idx)
+        where arrays are for paths that have valid (non-NaN) data at that day."""
+        out = {}
+        for y in checkpoints:
+            d_idx = int(y * TD)
+            if d_idx > max_days:
+                continue
+            col = real_eq[:, d_idx]
+            valid = ~np.isnan(col)
+            if not valid.any():
+                continue
+            real_vals = col[valid]
+            nom_vals = real_vals * cpi_factor[valid, d_idx]
+            idx = np.where(valid)[0]
+            out[y] = dict(real=real_vals, nominal=nom_vals, idx=idx)
+        return out
+
+    # Day indices for the user's checkpoints (used to capture leverage)
+    cp_days = np.array(
+        [int(y * TD) for y in checkpoints if int(y * TD) <= max_days],
+        dtype=np.int64)
+
+    # Unlev baseline
+    real_eq_u, called_u, _, lev_cp_u = simulate(ret_h, tsy_h, cpi_h, "static", 1.0,
+                                       C, S, T, S2, max_days, avail=avail_h,
+                                       checkpoint_days=cp_days, cap_real=cap_real)
+    ps_u = percentiles_at(real_eq_u, checkpoints, max_days)
+    proj_results = {"unlev": (1.0, ps_u)}
+    safety = {}   # name -> dict of safety metrics at T_rec
+    per_cp = {"unlev": per_checkpoint_arrays(real_eq_u)}
+    worst = {}   # name -> dict(entry_date, real_traj, nominal_traj, called)
+    # Leverage percentiles at each checkpoint, keyed by strategy
+    lev_summary = {"unlev": {y: dict(p25=1.0, p50=1.0, p75=1.0, p90=1.0)
+                              for y in checkpoints}}
+    def collect_worst_per_year(real_eq_arr, called_arr):
+        """For each checkpoint year, find the historical path with the lowest
+        real wealth AT THAT YEAR among paths still alive there."""
+        out = {}
+        for y in checkpoints:
+            d_idx = int(y * TD)
+            if d_idx > max_days:
+                continue
+            col = real_eq_arr[:, d_idx]
+            valid = ~np.isnan(col)
+            if not valid.any():
+                continue
+            mins = np.where(valid, col, np.inf)
+            wk = int(np.argmin(mins))
+            out[float(y)] = dict(
+                entry_date=str(entry_dates_h[wk]),
+                real_traj=real_eq_arr[wk, :].copy(),
+                nominal_traj=(real_eq_arr[wk, :] * cpi_factor[wk, :]).copy(),
+                called=bool(called_arr[wk]),
+                wealth_at_year=float(real_eq_arr[wk, d_idx]),
+            )
+        return out
+
+    worst["unlev"] = collect_worst_per_year(real_eq_u, called_u)
+
+    # No-cap comparison projections (run only if cap is active for the main run)
+    proj_no_cap = {}   # name -> per_cp dict (real & nominal arrays per checkpoint)
+
+    for name, spec in strategies:
+        c = calibrated[name]
+        T_target = c["T_rec"]
+        kind = spec["kind"]
+        F = spec.get("F", 1.5)
+        # Projection on historical (variable horizon) — uses cap_real
+        real_eq, called_h, peak_lev_h, lev_at_cp = simulate(
+            ret_h, tsy_h, cpi_h, kind, T_target,
+            C, S, T, S2, max_days, avail=avail_h, F=F,
+            checkpoint_days=cp_days, cap_real=cap_real)
+        ps = percentiles_at(real_eq, checkpoints, max_days)
+        proj_results[name] = (T_target, ps)
+        per_cp[name] = per_checkpoint_arrays(real_eq)
+
+        # Same projection without the leverage cap (for comparison)
+        if cap_real != float("inf"):
+            real_eq_nc, _, _, _ = simulate(
+                ret_h, tsy_h, cpi_h, kind, T_target,
+                C, S, T, S2, max_days, avail=avail_h, F=F,
+                cap_real=float("inf"))
+            proj_no_cap[name] = per_checkpoint_arrays(real_eq_nc)
+
+        # Leverage percentiles at each checkpoint (only over surviving paths)
+        lev_summary[name] = {}
+        for ci, y in enumerate(checkpoints):
+            if ci >= cp_days.shape[0]:
+                continue
+            col = lev_at_cp[:, ci]
+            valid = ~np.isnan(col)
+            if not valid.any():
+                continue
+            arr = col[valid]
+            lev_summary[name][y] = dict(
+                p25=float(np.percentile(arr, 25)),
+                p50=float(np.percentile(arr, 50)),
+                p75=float(np.percentile(arr, 75)),
+                p90=float(np.percentile(arr, 90)),
+            )
+
+        # Worst path at each checkpoint year (lowest real wealth that year)
+        worst[name] = collect_worst_per_year(real_eq, called_h)
+
+        # Safety on bootstrap (full horizon synthetic paths)
+        _, called_b, peak_lev_b, _ = simulate(
+            ret_b, tsy_b, cpi_b, kind, T_target,
+            C, S, T, S2, max_days, F=F, cap_real=cap_real)
+
+        # Peak leverage percentiles on SURVIVORS only (called paths hit >= 4.0x by definition)
+        survivors_h = peak_lev_h[~called_h]
+        survivors_b = peak_lev_b[~called_b]
+        # Calibration paths (full horizon) for additional context
+        _, called_cf, peak_lev_cf, _ = simulate(
+            ret_c, tsy_c, cpi_c, kind, T_target,
+            C, S, T, S2, max_days, avail=avail_c, F=F, cap_real=cap_real)
+
+        # Stress test (stretched drawdowns), if enabled
+        if ret_s is not None:
+            _, called_s, peak_lev_s, _ = simulate(
+                ret_s, tsy_c, cpi_c, kind, T_target,
+                C, S, T, S2, max_days, avail=avail_c, F=F, cap_real=cap_real)
+            survivors_s = peak_lev_s[~called_s]
+            stress_calls = int(called_s.sum())
+            n_stress = len(called_s)
+            peak_stress_max = float(survivors_s.max()) if len(survivors_s) else float("nan")
+            peak_stress_p99 = float(np.percentile(survivors_s, 99)) if len(survivors_s) else float("nan")
+        else:
+            stress_calls, n_stress = None, None
+            peak_stress_max = peak_stress_p99 = None
+
+        safety[name] = dict(
+            T_target=T_target,
+            n_hist=len(called_h), hist_calls=int(called_h.sum()),
+            n_calib=len(called_cf), calib_calls=int(called_cf.sum()),
+            n_boot=len(called_b), boot_calls=int(called_b.sum()),
+            n_stress=n_stress, stress_calls=stress_calls,
+            peak_lev_hist_p50=float(np.percentile(survivors_h, 50)) if len(survivors_h) else float("nan"),
+            peak_lev_hist_p90=float(np.percentile(survivors_h, 90)) if len(survivors_h) else float("nan"),
+            peak_lev_hist_p99=float(np.percentile(survivors_h, 99)) if len(survivors_h) else float("nan"),
+            peak_lev_hist_max=float(survivors_h.max()) if len(survivors_h) else float("nan"),
+            peak_lev_boot_p50=float(np.percentile(survivors_b, 50)) if len(survivors_b) else float("nan"),
+            peak_lev_boot_p90=float(np.percentile(survivors_b, 90)) if len(survivors_b) else float("nan"),
+            peak_lev_boot_p99=float(np.percentile(survivors_b, 99)) if len(survivors_b) else float("nan"),
+            peak_lev_boot_max=float(survivors_b.max()) if len(survivors_b) else float("nan"),
+            peak_stress_p99=peak_stress_p99,
+            peak_stress_max=peak_stress_max,
+        )
+
+    return calibrated, proj_results, safety, per_cp, worst, lev_summary, proj_no_cap
+
+
+# ---------------------------------------------------------------------------
+# Trigger compute on Run
+# ---------------------------------------------------------------------------
+
+if run or "results" not in st.session_state:
+    if not selected_strategies():
+        st.warning("Select at least one strategy from the sidebar.")
+    else:
+        with st.spinner("Loading paths..."):
+            paths = get_paths(max_days, n_bootstrap, block_years_int, seed)
+        with st.spinner("Calibrating + projecting..."):
+            t0 = time.time()
+            strategies_tuple = tuple(name for name, _ in selected_strategies())
+            paths_key = (max_days, n_bootstrap, block_years_int, int(seed))
+            cap_real_val = float(cap_wealth_M) * 1e6 if cap_enabled else float("inf")
+            calibrated, proj_results, safety, per_cp, worst, lev_summary, proj_no_cap = compute(
+                C, S, T, S2, max_days, tuple(checkpoints),
+                strategies_tuple, boot_target, stretch_F, dd_F, cap_real_val,
+                paths_key, paths)
+            elapsed = time.time() - t0
+        st.session_state["results"] = dict(
+            calibrated=calibrated,
+            proj_results=proj_results,
+            safety=safety,
+            per_cp=per_cp,
+            worst=worst,
+            lev_summary=lev_summary,
+            proj_no_cap=proj_no_cap,
+            cap_real=cap_real_val,
+            cap_enabled=cap_enabled,
+            cap_wealth_M=cap_wealth_M,
+            checkpoints=checkpoints,
+            params=dict(C=C, S=S, T=T, S2=S2,
+                        max_years=max_years, n_bootstrap=n_bootstrap,
+                        boot_target_pct=boot_target_pct, block_years=block_years,
+                        stretch_F=stretch_F, dd_F=dd_F),
+            elapsed=elapsed,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
+
+def fmt_money(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    if abs(x) >= 1e6:
+        return f"${x / 1e6:.2f}M"
+    return f"${x / 1e3:.0f}k"
+
+
+if "results" in st.session_state:
+    res = st.session_state["results"]
+    p = res["params"]
+
+    mode = "real" if real_dollars else "nominal"
+    mode_label = "real $ (today's purchasing power)" if real_dollars else "nominal $"
+
+    def get_pct(strategy_name, year):
+        """Return (p10, p25, p50, p75, p90, mean, n_paths) at year for mode."""
+        cp = res["per_cp"].get(strategy_name, {}).get(year)
+        if cp is None:
+            return None
+        arr = cp[mode]
+        if len(arr) == 0:
+            return None
+        ps = np.percentile(arr, [10, 25, 50, 75, 90])
+        return (float(ps[0]), float(ps[1]), float(ps[2]),
+                float(ps[3]), float(ps[4]), float(arr.mean()), int(len(arr)))
+
+    def get_T(strategy_name):
+        if strategy_name == "unlev":
+            return 1.0
+        c = res["calibrated"].get(strategy_name)
+        return c["T_rec"] if c else 1.0
+
+    st.success(
+        f"Computed in {res['elapsed']:.1f}s — "
+        f"C=${p['C']:,}, S=${p['S']:,}/yr (×{p['T']:g}y), S2=${p['S2']:,}/yr, "
+        f"horizon={p['max_years']:g}y. "
+        f"Showing: **{mode_label}**"
+    )
+
+    # --- Calibration table ---
+    st.subheader("Calibration")
+    st.caption(
+        "T_hist_safe = largest target with **0 historical calls** at full horizon. "
+        "T_boot_safe = largest target with **≤ target%** synthetic calls. "
+        "T_recommended = min of both (satisfies both safety bars)."
+    )
+    stretch_F_used = res["params"].get("stretch_F", 1.0)
+    calib_data = []
+    for name, c in res["calibrated"].items():
+        row = {
+            "Strategy": name,
+            "T_hist_safe": f"{c['T_hist']:.3f}x",
+            "Boot @ hist": f"{100 * c['boot_at_hist']:.2f}%",
+            "T_boot_safe": f"{c['T_boot']:.3f}x",
+        }
+        if stretch_F_used > 1.0 and c.get("T_stress") is not None:
+            row[f"T_stress (F={stretch_F_used:.2f})"] = f"{c['T_stress']:.3f}x"
+        row["T_recommended"] = f"{c['T_rec']:.3f}x"
+        calib_data.append(row)
+    st.dataframe(pd.DataFrame(calib_data), hide_index=True, use_container_width=True)
+    if stretch_F_used > 1.0:
+        st.caption(f"T_stress = largest target with **0% calls when every historical drawdown is amplified by F={stretch_F_used:.2f}**.")
+
+    # --- Safety verification at the recommended target ---
+    st.subheader("Safety @ recommended target")
+    st.caption(
+        "Margin-call counts and peak-leverage percentiles measured AT the T_recommended "
+        "value for each strategy. Hist (variable horizon) uses every post-1932 entry to its data limit; "
+        "Hist (full horizon) uses only entries with the full max-horizon of forward data; "
+        "Boot uses synthetic 1y-block-bootstrap paths. Peak leverage on SURVIVORS only "
+        "(called paths reach the call threshold by definition)."
+    )
+    safety_rows = []
+    safe_target_pct = res["params"]["boot_target_pct"]
+    for name, s in res["safety"].items():
+        boot_pct = 100 * s["boot_calls"] / max(s["n_boot"], 1)
+        row = {
+            "Strategy": name,
+            "T_target": f"{s['T_target']:.3f}x",
+            "Hist calls (variable)": f"{s['hist_calls']} / {s['n_hist']} ({100 * s['hist_calls'] / max(s['n_hist'], 1):.2f}%)",
+            "Hist calls (full)": f"{s['calib_calls']} / {s['n_calib']} ({100 * s['calib_calls'] / max(s['n_calib'], 1):.2f}%)",
+            "Boot calls": f"{s['boot_calls']} / {s['n_boot']} ({boot_pct:.2f}%)",
+            "Boot ≤ target?": "✅" if boot_pct <= safe_target_pct + 0.05 else "⚠️",
+        }
+        if s.get("n_stress") is not None:
+            stress_pct = 100 * s["stress_calls"] / max(s["n_stress"], 1)
+            row[f"Stress calls (F={stretch_F_used:.2f})"] = (
+                f"{s['stress_calls']} / {s['n_stress']} ({stress_pct:.2f}%)"
+            )
+        safety_rows.append(row)
+    st.dataframe(pd.DataFrame(safety_rows), hide_index=True, use_container_width=True)
+
+    # Peak leverage table
+    st.markdown("**Peak leverage observed (survivors), by strategy**")
+    peak_rows = []
+    for name, s in res["safety"].items():
+        peak_rows.append({
+            "Strategy": name,
+            "T_target": f"{s['T_target']:.3f}x",
+            "hist p50": f"{s['peak_lev_hist_p50']:.3f}x",
+            "hist p90": f"{s['peak_lev_hist_p90']:.3f}x",
+            "hist p99": f"{s['peak_lev_hist_p99']:.3f}x",
+            "hist max": f"{s['peak_lev_hist_max']:.3f}x",
+            "boot p50": f"{s['peak_lev_boot_p50']:.3f}x",
+            "boot p90": f"{s['peak_lev_boot_p90']:.3f}x",
+            "boot p99": f"{s['peak_lev_boot_p99']:.3f}x",
+            "boot max": f"{s['peak_lev_boot_max']:.3f}x",
+        })
+    st.dataframe(pd.DataFrame(peak_rows), hide_index=True, use_container_width=True)
+    st.caption(
+        "Call threshold = 4.000x. Peak-leverage values well below that on survivors confirm "
+        "the recommended target leaves headroom against drawdowns."
+    )
+
+    strategy_names = list(res["proj_results"].keys())
+
+    # --- Cross-strategy median comparison ---
+    st.subheader(f"Projected p50 by strategy & checkpoint ({mode_label})")
+    rows = []
+    for name in strategy_names:
+        row = {"Strategy": name, "T": f"{get_T(name):.3f}x"}
+        for y in res["checkpoints"]:
+            ps = get_pct(name, y)
+            row[f"{int(y)}y"] = fmt_money(ps[2]) if ps else "—"
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    # --- Line chart of p50 across strategies (static matplotlib, no zoom) ---
+    st.subheader(f"p50 trajectory ({mode_label}, in $M)")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for name in strategy_names:
+        ys, vals = [], []
+        for y in res["checkpoints"]:
+            ps = get_pct(name, y)
+            if ps:
+                ys.append(y)
+                vals.append(ps[2] / 1e6)
+        if ys:
+            ax.plot(ys, vals, marker="o", label=name)
+    ax.set_xlabel("Years")
+    ax.set_ylabel(f"Wealth (M USD, {mode_label.split(' ')[0]})")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    st.pyplot(fig, clear_figure=True)
+
+    # --- Cap on / cap off comparison ---
+    if res.get("cap_enabled") and res.get("proj_no_cap"):
+        cap_M = res.get("cap_wealth_M", 3.0)
+        st.subheader(
+            f"Cap-on vs cap-off comparison (stop levering at \\${cap_M:.1f}M, "
+            f"{mode_label})"
+        )
+        compare_strat = st.selectbox(
+            "Strategy to compare",
+            options=[s for s in strategy_names if s != "unlev"]
+                     if any(s != "unlev" for s in strategy_names) else strategy_names,
+            index=0,
+            key="cap_compare_strat",
+        )
+        if compare_strat:
+            on_arrs = res["per_cp"].get(compare_strat, {})
+            off_arrs = res["proj_no_cap"].get(compare_strat, {})
+            ys, on_p50, off_p50, on_p10, off_p10, on_p90, off_p90 = [], [], [], [], [], [], []
+            for y in res["checkpoints"]:
+                a_on = on_arrs.get(y, {}).get(mode) if isinstance(on_arrs.get(y), dict) else None
+                a_off = off_arrs.get(y, {}).get(mode) if isinstance(off_arrs.get(y), dict) else None
+                if a_on is None or a_off is None or len(a_on) == 0 or len(a_off) == 0:
+                    continue
+                ys.append(y)
+                on_p10.append(np.percentile(a_on, 10) / 1e6)
+                on_p50.append(np.percentile(a_on, 50) / 1e6)
+                on_p90.append(np.percentile(a_on, 90) / 1e6)
+                off_p10.append(np.percentile(a_off, 10) / 1e6)
+                off_p50.append(np.percentile(a_off, 50) / 1e6)
+                off_p90.append(np.percentile(a_off, 90) / 1e6)
+            if ys:
+                fig, ax = plt.subplots(figsize=(8, 4.5))
+                ax.fill_between(ys, on_p10, on_p90, alpha=0.18, color="C0",
+                                label="cap-on  p10-p90")
+                ax.plot(ys, on_p50, marker="o", color="C0", label="cap-on  p50")
+                ax.fill_between(ys, off_p10, off_p90, alpha=0.18, color="C1",
+                                label="cap-off p10-p90")
+                ax.plot(ys, off_p50, marker="s", color="C1", label="cap-off p50")
+                ax.axhline(cap_M, color="grey", linestyle=":", alpha=0.5,
+                           label=f"cap = {cap_M:.1f}M")
+                ax.set_xlabel("Years")
+                ax.set_ylabel("Wealth (M USD)")
+                ax.legend(loc="upper left", fontsize=8)
+                ax.grid(alpha=0.3)
+                st.pyplot(fig, clear_figure=True)
+                st.caption(
+                    f"Same strategy ({compare_strat} @ {get_T(compare_strat):.3f}x), "
+                    "same starting parameters; cap-on stops levering up the moment "
+                    f"real wealth crosses \\${cap_M:.1f}M, cap-off keeps levering. "
+                    "Cap-off captures more upside on lucky paths but exposes you to "
+                    "deeper drawdowns and more margin-call risk on unlucky ones."
+                )
+
+    # --- Probability of reaching target wealth ---
+    st.subheader(
+        f"Probability of reaching ≥ ${p.get('_target_M', target_wealth_M):.1f}M by year {target_year}"
+    )
+    target_dollars = float(target_wealth_M) * 1e6
+    prob_rows = []
+    for name in strategy_names:
+        cp = res["per_cp"].get(name, {}).get(float(target_year))
+        if cp is None or len(cp[mode]) == 0:
+            prob_rows.append({"Strategy": name, "T": f"{get_T(name):.3f}x",
+                              "P(≥ target)": "—", "n_paths": 0})
+            continue
+        arr = cp[mode]
+        prob = float((arr >= target_dollars).mean())
+        prob_rows.append({
+            "Strategy": name,
+            "T": f"{get_T(name):.3f}x",
+            "P(≥ target)": f"{100 * prob:.1f}%",
+            "n_paths": len(arr),
+        })
+    st.dataframe(pd.DataFrame(prob_rows), hide_index=True, use_container_width=True)
+    st.caption(
+        f"Fraction of historical paths whose {mode} wealth at year {target_year} "
+        f"reached or exceeded ${target_wealth_M:.1f}M. Adjust target $ and year in the sidebar."
+    )
+
+    # --- Wealth distribution histogram at a chosen checkpoint ---
+    st.subheader("Wealth distribution at a chosen checkpoint")
+    hist_year = st.selectbox(
+        "Checkpoint year for histogram",
+        options=res["checkpoints"],
+        index=min(len(res["checkpoints"]) - 1, 3),
+        format_func=lambda x: f"{int(x)}y",
+    )
+    hist_strats = st.multiselect(
+        "Strategies to overlay",
+        options=strategy_names,
+        default=[s for s in strategy_names if s in ("unlev", "dd_decay")],
+    )
+    if hist_strats:
+        import matplotlib.pyplot as plt
+        # Gather all strategies' clipped data first so we can use SHARED bin
+        # edges across them (same bin widths → bar heights are comparable).
+        clipped = []
+        for name in hist_strats:
+            cp = res["per_cp"].get(name, {}).get(float(hist_year))
+            if cp is None or len(cp[mode]) == 0:
+                continue
+            arr_M = cp[mode] / 1e6
+            cap = float(np.percentile(arr_M, 99))
+            clipped.append((name, np.clip(arr_M, 0, cap), len(arr_M)))
+        if clipped:
+            lo = min(arr.min() for _, arr, _ in clipped)
+            hi = max(arr.max() for _, arr, _ in clipped)
+            bins = np.linspace(lo, hi, 30)
+            fig, ax = plt.subplots(figsize=(8, 4))
+            for name, arr, n in clipped:
+                ax.hist(arr, bins=bins, alpha=0.5, label=f"{name} (n={n})")
+            ax.axvline(target_wealth_M, color="red", linestyle="--",
+                       label=f"target \\${target_wealth_M:.1f}M")
+            # Use plain text labels — avoid '$' which triggers matplotlib mathtext.
+            label_mode = "real" if real_dollars else "nominal"
+            ax.set_xlabel(f"Wealth at year {int(hist_year)} ({label_mode}, M USD)")
+            ax.set_ylabel("# paths")
+            ax.legend()
+            ax.grid(alpha=0.3)
+            st.pyplot(fig, clear_figure=True)
+            st.caption("Histogram clipped at each strategy's p99; shared bin edges so bars across "
+                       "strategies are directly comparable. Red dashed line = target wealth.")
+
+    # --- Per-strategy detailed percentiles ---
+    st.subheader(f"Detailed percentiles per strategy ({mode_label})")
+    pct_labels = ["p10", "p25", "p50", "p75", "p90", "mean"]
+    for name in strategy_names:
+        T_t = get_T(name)
+        with st.expander(f"{name} @ {T_t:.3f}x",
+                         expanded=(name == "dd_decay" or name == "unlev")):
+            rows = []
+            for y in res["checkpoints"]:
+                ps = get_pct(name, y)
+                if ps is None:
+                    continue
+                row = {"Year": f"{int(y)}y"}
+                for i, label in enumerate(pct_labels):
+                    row[label] = fmt_money(ps[i])
+                row["paths"] = ps[6]
+                rows.append(row)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    # --- p10/p90 fan chart for one strategy ---
+    st.subheader(f"Wealth fan (p10 / p50 / p90), {mode_label}")
+    strategy_to_fan = st.selectbox(
+        "Choose a strategy to display the fan",
+        options=strategy_names,
+        index=min(len(strategy_names) - 1, 1),
+    )
+    if strategy_to_fan:
+        ys, p10s, p50s, p90s = [], [], [], []
+        for y in res["checkpoints"]:
+            ps = get_pct(strategy_to_fan, y)
+            if ps:
+                ys.append(y)
+                p10s.append(ps[0] / 1e6)
+                p50s.append(ps[2] / 1e6)
+                p90s.append(ps[4] / 1e6)
+        if ys:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.fill_between(ys, p10s, p90s, alpha=0.2, label="p10–p90")
+            ax.plot(ys, p50s, marker="o", color="C0", label="p50")
+            ax.plot(ys, p10s, linestyle="--", color="C0", alpha=0.7, label="p10")
+            ax.plot(ys, p90s, linestyle="--", color="C0", alpha=0.7, label="p90")
+            ax.set_xlabel("Years")
+            ax.set_ylabel("Wealth (M USD)")
+            ax.legend()
+            ax.grid(alpha=0.3)
+            st.pyplot(fig, clear_figure=True)
+
+    # --- Worst-path inspector ---
+    st.subheader("Worst historical path at a chosen horizon")
+    col_strat, col_year = st.columns(2)
+    with col_strat:
+        worst_name = st.selectbox(
+            "Strategy",
+            options=strategy_names,
+            index=min(len(strategy_names) - 1, 1),
+            key="worst_strat",
+        )
+    with col_year:
+        worst_year = st.selectbox(
+            "Worst-at-year (horizon)",
+            options=res["checkpoints"],
+            index=min(len(res["checkpoints"]) - 1, 3),
+            format_func=lambda x: f"{int(x)}y",
+            key="worst_year",
+        )
+    w_dict = res["worst"].get(worst_name, {})
+    w = w_dict.get(float(worst_year))
+    if w is not None:
+        traj_arr = w["real_traj"] if real_dollars else w["nominal_traj"]
+        valid_d = ~np.isnan(traj_arr)
+        if valid_d.any():
+            horizon_d = int(float(worst_year) * TD)
+            last_valid_d = int(np.where(valid_d)[0].max())
+            last_d = min(horizon_d, last_valid_d)   # clip to selected horizon
+            xs = np.arange(last_d + 1) / TD
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(xs, traj_arr[:last_d + 1] / 1e6, color="C3")
+            ax.axhline(w["wealth_at_year"] / 1e6, color="grey", linestyle=":",
+                       alpha=0.4, label=f"wealth at horizon = "
+                                          f"\\${w['wealth_at_year']/1e6:.2f}M")
+            ax.set_xlabel("Years")
+            ax.set_ylabel("Wealth (M USD)")
+            ax.set_xlim(0, float(worst_year))
+            ax.legend()
+            ax.grid(alpha=0.3)
+            st.pyplot(fig, clear_figure=True)
+        st.caption(
+            f"Lowest-real-wealth path AT YEAR {int(worst_year)}: entered "
+            f"**{w['entry_date']}**, real wealth at year {int(worst_year)} = "
+            f"**\\${w['wealth_at_year']/1e6:.2f}M** "
+            f"({'CALLED' if w['called'] else 'survived'} the strategy)."
+        )
+    else:
+        st.info("No worst-path data for this strategy/horizon combination "
+                "(maybe horizon exceeds available historical data).")
+
+    # --- Leverage at checkpoints ---
+    st.subheader("Leverage ratio at checkpoints (median across paths)")
+    st.caption(
+        "Static drifts down naturally as DCA dilutes leverage. Relever holds at target. "
+        "dd_decay ratchets target down on observed drawdowns. "
+        "Unlev is fixed at 1.000x."
+    )
+    lev_summary = res.get("lev_summary", {})
+    rows = []
+    for name in strategy_names:
+        row = {"Strategy": name, "T_init": f"{get_T(name):.3f}x"}
+        for y in res["checkpoints"]:
+            d = lev_summary.get(name, {}).get(y)
+            row[f"{int(y)}y"] = f"{d['p50']:.3f}x" if d else "—"
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    # Median leverage trajectory across strategies
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for name in strategy_names:
+        ys_lev, vals = [], []
+        for y in res["checkpoints"]:
+            d = lev_summary.get(name, {}).get(y)
+            if d:
+                ys_lev.append(y)
+                vals.append(d["p50"])
+        if ys_lev:
+            ax.plot(ys_lev, vals, marker="o", label=name)
+    ax.axhline(1.0, color="grey", linestyle=":", alpha=0.5, label="unleveraged")
+    ax.axhline(4.0, color="red", linestyle=":", alpha=0.4, label="call threshold (4.0x)")
+    ax.set_xlabel("Years")
+    ax.set_ylabel("Leverage (median)")
+    ax.set_ylim(bottom=0.95)
+    ax.legend()
+    ax.grid(alpha=0.3)
+    st.pyplot(fig, clear_figure=True)
+
+    with st.expander("Leverage detail (p25 / p50 / p75 / p90)"):
+        for name in strategy_names:
+            sub_rows = []
+            for y in res["checkpoints"]:
+                d = lev_summary.get(name, {}).get(y)
+                if not d:
+                    continue
+                sub_rows.append({
+                    "Year": f"{int(y)}y",
+                    "p25": f"{d['p25']:.3f}x",
+                    "p50": f"{d['p50']:.3f}x",
+                    "p75": f"{d['p75']:.3f}x",
+                    "p90": f"{d['p90']:.3f}x",
+                })
+            st.markdown(f"**{name}** @ T_init = {get_T(name):.3f}x")
+            st.dataframe(pd.DataFrame(sub_rows), hide_index=True, use_container_width=True)
+
+else:
+    st.info("Click **Run / refresh** to compute.")
