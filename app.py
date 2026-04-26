@@ -166,8 +166,18 @@ with st.sidebar:
         wealth_X_M = st.slider(
             "wealth_X target ($M, real)", 1.0, 20.0, 3.0, step=0.5,
             help="Real-dollar wealth at which wealth_decay / hybrid hit 1.0x. "
-                 "Linear interpolation from T_init at C to 1.0x at wealth_X. "
                  "Below C: target = T_init. Above wealth_X: target = 1.0x.")
+        wealth_glide_exp = st.slider(
+            "wealth_glide exponent (1=linear, 2=quadratic, 3=cubic)",
+            1.0, 3.0, 1.0, step=0.5,
+            help="Shape of the wealth_decay glide. exp=1 (linear) deleverages "
+                 "uniformly. exp=2 (quadratic) keeps target near T_init for "
+                 "low wealth and only deleverages aggressively near wealth_X "
+                 "(prog² < prog for prog<1). exp=3 even more backloaded. "
+                 "Higher exp preserves more leverage in early years. "
+                 "Affects all wealth-aware kinds (hybrid, adaptive_hybrid, "
+                 "recal_hybrid, meta_recal, etc.) and the wealth-X cap on "
+                 "recal lifts.")
         vol_factor = st.slider(
             "vol_hybrid: vol_factor", 0.0, 3.0, 1.0, step=0.1,
             help="Multiplier on annualized 60d realized vol. 1.0 = a 30% vol "
@@ -347,7 +357,7 @@ def selected_strategies():
 def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
             boot_target, stretch_F, dd_F, cap_real, wealth_X,
             vol_factor, dip_threshold, dip_bonus, rate_threshold, rate_factor,
-            recal_period_months,
+            recal_period_months, wealth_glide_exp,
             _paths_key, _paths):
     """Cached calibration + projection.
     Cache keys on the leading scalars + tuples; `_paths` is opaque (underscore
@@ -396,6 +406,7 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         dip_bonus=dip_bonus,
         rate_threshold=rate_threshold,
         rate_factor=rate_factor,
+        wealth_glide_exp=wealth_glide_exp,
     )
 
     # Identify which strategies need which lookup tables.
@@ -453,7 +464,8 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                 ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b,
                 boot_target=boot_target,
                 ret_s=ret_s_for_recal, stretch_F=stretch_F,
-                score_horizon_days=score_horizon_days_local)
+                score_horizon_days=score_horizon_days_local,
+                wealth_glide_exp=wealth_glide_exp)
         # Build 3D meta tables if needed (fixed order static / hybrid / adaptive_hybrid).
         # Wealth-aware candidates only — see recal_strategies_needed comment above.
         if needs_meta:
@@ -841,7 +853,7 @@ if run or "results" not in st.session_state:
                 wealth_X_val,
                 float(vol_factor), dip_threshold_val, float(dip_bonus),
                 rate_threshold_val, float(rate_factor),
-                int(recal_period_months),
+                int(recal_period_months), float(wealth_glide_exp),
                 paths_key, paths)
             elapsed = time.time() - t0
         st.session_state["results"] = dict(

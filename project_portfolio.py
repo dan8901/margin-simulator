@@ -222,7 +222,7 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
                          hist_target=0.0, hi=3.0, coarse_n=10, fine_n=10,
                          ret_b=None, tsy_b=None, cpi_b=None, boot_target=0.01,
                          ret_s=None, stretch_F=1.0,
-                         score_horizon_days=None):
+                         score_horizon_days=None, wealth_glide_exp=1.0):
     """Pre-compute T_max(E_real, H_remaining_years) for `kind` base strategy.
 
     For each (E_real, H_rem) cell, takes the **well-defended** T_max =
@@ -304,6 +304,7 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
                 float(e0), float(S2), 1e9, float(S2),
                 h_days, avail=avail_h_e, hi=hi, F=F, wealth_X=wealth_X,
                 coarse_n=coarse_n, fine_n=fine_n,
+                wealth_glide_exp=wealth_glide_exp,
             )
             T_boot = float("inf")
             if use_boot:
@@ -312,6 +313,7 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
                     float(e0), float(S2), 1e9, float(S2),
                     h_days, hi=hi, F=F, wealth_X=wealth_X,
                     coarse_n=coarse_n, fine_n=fine_n,
+                    wealth_glide_exp=wealth_glide_exp,
                 )
             T_stress = float("inf")
             if use_stress:
@@ -320,6 +322,7 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
                     float(e0), float(S2), 1e9, float(S2),
                     h_days, avail=avail_h_e, hi=hi, F=F, wealth_X=wealth_X,
                     coarse_n=coarse_n, fine_n=fine_n,
+                    wealth_glide_exp=wealth_glide_exp,
                 )
             T_safe = min(T_hist, T_boot, T_stress)
             t_table[i, j] = T_safe
@@ -336,7 +339,8 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
                 ret_h, tsy_h, cpi_h, kind, T_safe,
                 float(e0), float(S2), 1e9, float(S2),
                 sh_days, avail=np.minimum(avail_h_e, sh_days),
-                F=F, wealth_X=wealth_X)
+                F=F, wealth_X=wealth_X,
+                wealth_glide_exp=wealth_glide_exp)
             terminal = real_eq[:, sh_days]
             valid = ~(np.isnan(terminal) | called_score)
             if valid.any():
@@ -349,7 +353,7 @@ def compute_recal_tables_multi(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid,
                                 hist_target=0.0, coarse_n=8, fine_n=8,
                                 ret_b=None, tsy_b=None, cpi_b=None,
                                 boot_target=0.01, ret_s=None, stretch_F=1.0,
-                                score_horizon_days=None):
+                                score_horizon_days=None, wealth_glide_exp=1.0):
     """Compute well-defended recal lookup tables for multiple base strategies.
 
     Returns:
@@ -369,7 +373,8 @@ def compute_recal_tables_multi(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid,
             coarse_n=coarse_n, fine_n=fine_n,
             ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b, boot_target=boot_target,
             ret_s=ret_s, stretch_F=stretch_F,
-            score_horizon_days=score_horizon_days)
+            score_horizon_days=score_horizon_days,
+            wealth_glide_exp=wealth_glide_exp)
     return t_3d, score_3d
 
 
@@ -409,7 +414,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                    recal_period_days, t_recal_table, e_recal_grid,
                    h_recal_grid_days,
                    t_recal_tables_meta, meta_score_tables, meta_strategy_codes,
-                   init_strat_idx):
+                   init_strat_idx, wealth_glide_exp):
     """JIT-compiled per-day, per-path inner loop. Avoids temporary array
     allocations entirely. kind_code: 0=static, 1=relever, 2=dd_decay,
     3=wealth_decay, 4=hybrid, 5=r_hybrid, 6=vol_hybrid, 7=dip_hybrid,
@@ -555,7 +560,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                             prog = 0.0
                         elif prog > 1.0:
                             prog = 1.0
-                        cand_w = T_init - (T_init - floor) * prog
+                        cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                     else:
                         cand_w = floor
                     target_lev = cand_dd if cand_dd < cand_w else cand_w
@@ -599,7 +604,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                             prog = 0.0
                         elif prog > 1.0:
                             prog = 1.0
-                        cand_w = T_init - (T_init - floor) * prog
+                        cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                     else:
                         cand_w = floor
                     base = cand_dd if cand_dd < cand_w else cand_w
@@ -623,7 +628,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                             prog = 0.0
                         elif prog > 1.0:
                             prog = 1.0
-                        cand_w = T_init - (T_init - floor) * prog
+                        cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                     else:
                         cand_w = floor
                     base = cand_dd if cand_dd < cand_w else cand_w
@@ -652,7 +657,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                             prog = 0.0
                         elif prog > 1.0:
                             prog = 1.0
-                        cand_w = T_init - (T_init - floor) * prog
+                        cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                     else:
                         cand_w = floor
                     base = cand_dd if cand_dd < cand_w else cand_w
@@ -713,7 +718,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                             prog = 0.0
                         elif prog > 1.0:
                             prog = 1.0
-                        cand_w = T_init - (T_init - floor) * prog
+                        cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                     else:
                         cand_w = floor
                     target_lev = cur_tgt[k] if cur_tgt[k] < cand_w else cand_w
@@ -757,7 +762,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                             prog = 0.0
                         elif prog > 1.0:
                             prog = 1.0
-                        cand_w_cap = target_lev - (target_lev - floor) * prog
+                        cand_w_cap = target_lev - (target_lev - floor) * (prog ** wealth_glide_exp)
                         if cand_w_cap < target_lev:
                             target_lev = cand_w_cap
                 elif kind_code == 12:   # recal_hybrid
@@ -799,7 +804,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w_cap = new_T - (new_T - floor) * prog
+                            cand_w_cap = new_T - (new_T - floor) * (prog ** wealth_glide_exp)
                             if cand_w_cap < new_T:
                                 new_T = cand_w_cap
                         T_active[k] = new_T
@@ -825,7 +830,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w = T_init - (T_init - floor) * prog
+                            cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                         else:
                             cand_w = floor
                         target_lev = cand_dd if cand_dd < cand_w else cand_w
@@ -867,7 +872,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w_cap = new_T - (new_T - floor) * prog
+                            cand_w_cap = new_T - (new_T - floor) * (prog ** wealth_glide_exp)
                             if cand_w_cap < new_T:
                                 new_T = cand_w_cap
                         T_active[k] = new_T
@@ -950,7 +955,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w_cap = best_T - (best_T - floor) * prog
+                            cand_w_cap = best_T - (best_T - floor) * (prog ** wealth_glide_exp)
                             if cand_w_cap < best_T:
                                 best_T = cand_w_cap
                         T_active[k] = best_T
@@ -985,7 +990,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                                     prog = 0.0
                                 elif prog > 1.0:
                                     prog = 1.0
-                                cand_w = T_init - (T_init - floor) * prog
+                                cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                             else:
                                 cand_w = floor
                             target_lev = cand_dd if cand_dd < cand_w else cand_w
@@ -1018,7 +1023,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                                     prog = 0.0
                                 elif prog > 1.0:
                                     prog = 1.0
-                                cand_w = T_init - (T_init - floor) * prog
+                                cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                             else:
                                 cand_w = floor
                             target_lev = cur_tgt[k] if cur_tgt[k] < cand_w else cand_w
@@ -1068,7 +1073,7 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
              e_recal_grid=None, h_recal_grid_days=None,
              t_recal_tables_meta=None, meta_score_tables=None,
              meta_strategy_codes=None,
-             init_strat_idx=0):
+             init_strat_idx=0, wealth_glide_exp=1.0):
     """Wrapper around the JIT inner loop. Coerces `kind` string to int and
     sets defaults. Returns (real_eq, called, peak_lev, lev_at_cp).
 
@@ -1131,7 +1136,7 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                           e_recal_grid, h_recal_grid_days,
                           t_recal_tables_meta, meta_score_tables,
                           meta_strategy_codes,
-                          int(init_strat_idx))
+                          int(init_strat_idx), float(wealth_glide_exp))
 
 
 def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
@@ -1142,7 +1147,7 @@ def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
               e_recal_grid=None, h_recal_grid_days=None,
               t_recal_tables_meta=None, meta_score_tables=None,
               meta_strategy_codes=None,
-              init_strat_idx=0):
+              init_strat_idx=0, wealth_glide_exp=1.0):
     _, called, _, _ = simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                             avail=avail, F=F, cap_real=cap_real, wealth_X=wealth_X,
                             vol_factor=vol_factor, dip_threshold=dip_threshold,
@@ -1155,7 +1160,8 @@ def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                             t_recal_tables_meta=t_recal_tables_meta,
                             meta_score_tables=meta_score_tables,
                             meta_strategy_codes=meta_strategy_codes,
-                            init_strat_idx=init_strat_idx)
+                            init_strat_idx=init_strat_idx,
+                            wealth_glide_exp=wealth_glide_exp)
     return float(called.mean())
 
 
@@ -1171,7 +1177,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                         recal_period_days, t_recal_table, e_recal_grid,
                         h_recal_grid_days,
                         t_recal_tables_meta, meta_score_tables, meta_strategy_codes,
-                        init_strat_idx):
+                        init_strat_idx, wealth_glide_exp):
     """Vectorized over T. Runs all T_inits values simultaneously, sharing the
     same per-path data. Returns `called[K, T_count]` only — skips real_eq,
     peak_lev, and leverage tracking since binary search only needs call counts.
@@ -1296,7 +1302,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w = T_init - (T_init - floor) * prog
+                            cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                         else:
                             cand_w = floor
                         target_lev = cand_dd if cand_dd < cand_w else cand_w
@@ -1340,7 +1346,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w = T_init - (T_init - floor) * prog
+                            cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                         else:
                             cand_w = floor
                         base = cand_dd if cand_dd < cand_w else cand_w
@@ -1364,7 +1370,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w = T_init - (T_init - floor) * prog
+                            cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                         else:
                             cand_w = floor
                         base = cand_dd if cand_dd < cand_w else cand_w
@@ -1393,7 +1399,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w = T_init - (T_init - floor) * prog
+                            cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                         else:
                             cand_w = floor
                         base = cand_dd if cand_dd < cand_w else cand_w
@@ -1454,7 +1460,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w = T_init - (T_init - floor) * prog
+                            cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                         else:
                             cand_w = floor
                         target_lev = cur_tgt[k, t] if cur_tgt[k, t] < cand_w else cand_w
@@ -1495,7 +1501,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                 prog = 0.0
                             elif prog > 1.0:
                                 prog = 1.0
-                            cand_w_cap = target_lev - (target_lev - floor) * prog
+                            cand_w_cap = target_lev - (target_lev - floor) * (prog ** wealth_glide_exp)
                             if cand_w_cap < target_lev:
                                 target_lev = cand_w_cap
                     elif kind_code == 12:   # recal_hybrid (grid)
@@ -1536,7 +1542,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                     prog = 0.0
                                 elif prog > 1.0:
                                     prog = 1.0
-                                cand_w_cap = new_T - (new_T - floor) * prog
+                                cand_w_cap = new_T - (new_T - floor) * (prog ** wealth_glide_exp)
                                 if cand_w_cap < new_T:
                                     new_T = cand_w_cap
                             T_active[k, t] = new_T
@@ -1561,7 +1567,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                     prog = 0.0
                                 elif prog > 1.0:
                                     prog = 1.0
-                                cand_w = T_init - (T_init - floor) * prog
+                                cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                             else:
                                 cand_w = floor
                             target_lev = cand_dd if cand_dd < cand_w else cand_w
@@ -1603,7 +1609,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                     prog = 0.0
                                 elif prog > 1.0:
                                     prog = 1.0
-                                cand_w_cap = new_T - (new_T - floor) * prog
+                                cand_w_cap = new_T - (new_T - floor) * (prog ** wealth_glide_exp)
                                 if cand_w_cap < new_T:
                                     new_T = cand_w_cap
                             T_active[k, t] = new_T
@@ -1682,7 +1688,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                     prog = 0.0
                                 elif prog > 1.0:
                                     prog = 1.0
-                                cand_w_cap = best_T - (best_T - floor) * prog
+                                cand_w_cap = best_T - (best_T - floor) * (prog ** wealth_glide_exp)
                                 if cand_w_cap < best_T:
                                     best_T = cand_w_cap
                             T_active[k, t] = best_T
@@ -1715,7 +1721,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                         prog = 0.0
                                     elif prog > 1.0:
                                         prog = 1.0
-                                    cand_w = T_init - (T_init - floor) * prog
+                                    cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                                 else:
                                     cand_w = floor
                                 target_lev = cand_dd if cand_dd < cand_w else cand_w
@@ -1748,7 +1754,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                         prog = 0.0
                                     elif prog > 1.0:
                                         prog = 1.0
-                                    cand_w = T_init - (T_init - floor) * prog
+                                    cand_w = T_init - (T_init - floor) * (prog ** wealth_glide_exp)
                                 else:
                                     cand_w = floor
                                 target_lev = cur_tgt[k, t] if cur_tgt[k, t] < cand_w else cand_w
@@ -1774,7 +1780,7 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
                           e_recal_grid=None, h_recal_grid_days=None,
                           t_recal_tables_meta=None, meta_score_tables=None,
                           meta_strategy_codes=None,
-                          init_strat_idx=0):
+                          init_strat_idx=0, wealth_glide_exp=1.0):
     """Two-pass grid search for largest T_init with call rate ≤ target.
 
     Pass 1: coarse linear grid over [lo, hi] with coarse_n points.
@@ -1826,7 +1832,8 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
                                      e_recal_grid, h_recal_grid_days,
                                      t_recal_tables_meta, meta_score_tables,
                                      meta_strategy_codes,
-                                     int(init_strat_idx))
+                                     int(init_strat_idx),
+                                     float(wealth_glide_exp))
         return called.mean(axis=0)
 
     coarse = np.linspace(lo, hi, coarse_n)
