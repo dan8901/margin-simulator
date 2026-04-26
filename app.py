@@ -168,15 +168,15 @@ with st.sidebar:
             help="Real-dollar wealth at which wealth_decay / hybrid hit 1.0x. "
                  "Below C: target = T_init. Above wealth_X: target = 1.0x.")
         wealth_glide_exp = st.slider(
-            "wealth_glide exponent (1=linear, 2=quadratic, 3=cubic)",
-            1.0, 3.0, 2.0, step=0.5,
-            help="Shape of the wealth_decay glide. exp=1 (linear) deleverages "
-                 "uniformly. exp=2 (quadratic) keeps target near T_init for "
-                 "low wealth and only deleverages aggressively near wealth_X "
-                 "(prog² < prog for prog<1). exp=3 even more backloaded. "
-                 "Higher exp preserves more leverage in early years. "
-                 "Affects all wealth-aware kinds (hybrid, adaptive_hybrid, "
-                 "recal_hybrid, meta_recal, etc.) and the wealth-X cap on "
+            "wealth_glide exponent (1=linear, 10+=heavily back-loaded)",
+            1.0, 20.0, 10.0, step=1.0,
+            help="Shape of the wealth_decay glide. cap = T_init − "
+                 "(T_init − 1) × prog^exp. exp=1 (linear) deleverages "
+                 "uniformly. Higher exp keeps target near T_init for low/mid "
+                 "wealth and only deleverages aggressively near wealth_X. "
+                 "Reference at prog=0.9 (real_eq=90% of way to wealth_X): "
+                 "exp=1→cap drops by 90%, exp=10→by 35%, exp=20→by 12%. "
+                 "Affects all wealth-aware kinds and the wealth-X cap on "
                  "recal lifts.")
         vol_factor = st.slider(
             "vol_hybrid: vol_factor", 0.0, 3.0, 1.0, step=0.1,
