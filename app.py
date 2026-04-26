@@ -677,12 +677,14 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         T_target = c["T_rec"]
         kind = spec["kind"]
         F = spec.get("F", 1.5)
+        init_strat_idx = c.get("init_strat_idx", 0)
         # Projection on historical (variable horizon) — uses cap_real
         real_eq, called_h, peak_lev_h, lev_at_cp = simulate(
             ret_h, tsy_h, cpi_h, kind, T_target,
             C, S, T, S2, max_days, avail=avail_h, F=F,
             checkpoint_days=cp_days, cap_real=cap_real, wealth_X=wealth_X,
-            **overlay_kw, **recal_kw_for(name))
+            **overlay_kw, **recal_kw_for(name),
+            init_strat_idx=init_strat_idx)
         ps = percentiles_at(real_eq, checkpoints, max_days)
         proj_results[name] = (T_target, ps)
         per_cp[name] = per_checkpoint_arrays(real_eq)
@@ -692,7 +694,9 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
             real_eq_nc, _, _, _ = simulate(
                 ret_h, tsy_h, cpi_h, kind, T_target,
                 C, S, T, S2, max_days, avail=avail_h, F=F,
-                cap_real=float("inf"), wealth_X=wealth_X, **overlay_kw, **recal_kw_for(name))
+                cap_real=float("inf"), wealth_X=wealth_X, **overlay_kw,
+                **recal_kw_for(name),
+                init_strat_idx=init_strat_idx)
             proj_no_cap[name] = per_checkpoint_arrays(real_eq_nc)
 
         # Leverage percentiles at each checkpoint (only over surviving paths)
@@ -719,7 +723,8 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         _, called_b, peak_lev_b, _ = simulate(
             ret_b, tsy_b, cpi_b, kind, T_target,
             C, S, T, S2, max_days, F=F, cap_real=cap_real, wealth_X=wealth_X,
-            **overlay_kw, **recal_kw_for(name))
+            **overlay_kw, **recal_kw_for(name),
+            init_strat_idx=init_strat_idx)
 
         # Peak leverage percentiles on SURVIVORS only (called paths hit >= 4.0x by definition)
         survivors_h = peak_lev_h[~called_h]
@@ -728,14 +733,16 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         _, called_cf, peak_lev_cf, _ = simulate(
             ret_c, tsy_c, cpi_c, kind, T_target,
             C, S, T, S2, max_days, avail=avail_c, F=F, cap_real=cap_real,
-            wealth_X=wealth_X, **overlay_kw, **recal_kw_for(name))
+            wealth_X=wealth_X, **overlay_kw, **recal_kw_for(name),
+            init_strat_idx=init_strat_idx)
 
         # Stress test (stretched drawdowns), if enabled
         if ret_s is not None:
             _, called_s, peak_lev_s, _ = simulate(
                 ret_s, tsy_c, cpi_c, kind, T_target,
                 C, S, T, S2, max_days, avail=avail_c, F=F, cap_real=cap_real,
-                wealth_X=wealth_X, **overlay_kw, **recal_kw_for(name))
+                wealth_X=wealth_X, **overlay_kw, **recal_kw_for(name),
+                init_strat_idx=init_strat_idx)
             survivors_s = peak_lev_s[~called_s]
             stress_calls = int(called_s.sum())
             n_stress = len(called_s)
