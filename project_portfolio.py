@@ -955,7 +955,8 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
              rate_threshold=float("inf"), rate_factor=0.0,
              recal_period_days=0, t_recal_table=None,
              e_recal_grid=None, h_recal_grid_days=None,
-             t_recal_tables_meta=None, meta_strategy_codes=None):
+             t_recal_tables_meta=None, meta_strategy_codes=None,
+             init_strat_idx=0):
     """Wrapper around the JIT inner loop. Coerces `kind` string to int and
     sets defaults. Returns (real_eq, called, peak_lev, lev_at_cp).
 
@@ -1012,7 +1013,8 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                           float(rate_factor),
                           int(recal_period_days), t_recal_table,
                           e_recal_grid, h_recal_grid_days,
-                          t_recal_tables_meta, meta_strategy_codes)
+                          t_recal_tables_meta, meta_strategy_codes,
+                          int(init_strat_idx))
 
 
 def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
@@ -1021,7 +1023,8 @@ def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
               rate_threshold=float("inf"), rate_factor=0.0,
               recal_period_days=0, t_recal_table=None,
               e_recal_grid=None, h_recal_grid_days=None,
-              t_recal_tables_meta=None, meta_strategy_codes=None):
+              t_recal_tables_meta=None, meta_strategy_codes=None,
+              init_strat_idx=0):
     _, called, _, _ = simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                             avail=avail, F=F, cap_real=cap_real, wealth_X=wealth_X,
                             vol_factor=vol_factor, dip_threshold=dip_threshold,
@@ -1032,7 +1035,8 @@ def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                             e_recal_grid=e_recal_grid,
                             h_recal_grid_days=h_recal_grid_days,
                             t_recal_tables_meta=t_recal_tables_meta,
-                            meta_strategy_codes=meta_strategy_codes)
+                            meta_strategy_codes=meta_strategy_codes,
+                            init_strat_idx=init_strat_idx)
     return float(called.mean())
 
 
@@ -1604,7 +1608,8 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
                           rate_threshold=float("inf"), rate_factor=0.0,
                           recal_period_days=0, t_recal_table=None,
                           e_recal_grid=None, h_recal_grid_days=None,
-                          t_recal_tables_meta=None, meta_strategy_codes=None):
+                          t_recal_tables_meta=None, meta_strategy_codes=None,
+                          init_strat_idx=0):
     """Two-pass grid search for largest T_init with call rate ≤ target.
 
     Pass 1: coarse linear grid over [lo, hi] with coarse_n points.
@@ -1650,7 +1655,8 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
                                      float(rate_factor),
                                      int(recal_period_days), t_recal_table,
                                      e_recal_grid, h_recal_grid_days,
-                                     t_recal_tables_meta, meta_strategy_codes)
+                                     t_recal_tables_meta, meta_strategy_codes,
+                                     int(init_strat_idx))
         return called.mean(axis=0)
 
     coarse = np.linspace(lo, hi, coarse_n)
