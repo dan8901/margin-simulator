@@ -16,6 +16,7 @@ re-runs on every press of the button.
 
 import time
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -44,62 +45,138 @@ st.caption(
     "(historical and bootstrap-defended)."
 )
 
+with st.expander("About this tool / disclaimers"):
+    st.markdown(
+        """
+**What this is**
+
+A backtest-driven simulator for leveraged S&P 500 strategies in a long-horizon
+hold-forever taxable account. Given your savings pattern and a horizon, it:
+
+1. **Calibrates** safe leverage targets per strategy across post-1932 historical
+   paths AND synthetic block-bootstrap paths (so the answer doesn't depend on
+   the specific historical sequence).
+2. **Projects** real-dollar wealth percentiles (CPI-adjusted) at the checkpoint
+   years you choose.
+3. **Verifies safety** by reporting actual margin-call counts and peak-leverage
+   distributions at the recommended target.
+
+Sources: SPX-TR daily 1927-2026 (Bloomberg + yfinance), 3M Treasury (FRED
+DGS3MO), CPI-U (FRED CPIAUCNS). Margin rate modeled as box-spread financing
+(3M Tsy + 15bps) with a 20% effective tax saving from Section-1256 60/40
+loss recognition. Margin call threshold = 4.0x leverage (Reg-T 25%
+maintenance).
+
+**What this isn't**
+
+Not financial advice. Past performance is not predictive — the historical
+sample includes one ~83% drawdown (1929-32) deliberately excluded from
+calibration, so your tail risk in the real future could exceed what's
+modeled. Tax model is intentionally simplified. Real margin calls can
+happen intraday, not just at daily close. Use this to think, not to act.
+
+**Source code**: [github.com/dan8901/margin-simulator](https://github.com/dan8901/margin-simulator)
+"""
+    )
+
 
 # ---------------------------------------------------------------------------
 # Sidebar — parameters
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("Scenario")
-    C = st.number_input("Current portfolio C ($)", value=160_000,
-                        step=10_000, min_value=0)
-    S = st.number_input("Annual savings S ($/yr, today's $)", value=180_000,
-                        step=10_000, min_value=0)
-    T = st.slider("Years saving S (T)", 0.0, 30.0, 5.0, step=1.0)
-    S2 = st.number_input("Savings after T (S2 $/yr)", value=30_000,
-                         step=5_000, min_value=0)
+    # SCENARIO — most-tweaked, default open
+    with st.expander("Scenario", expanded=True):
+        C = st.number_input(
+            "Current portfolio C ($)", value=160_000, step=10_000, min_value=0,
+            help="Total liquid investable assets you have today. Real $ throughout.")
+        S = st.number_input(
+            "Annual savings S ($/yr, today's $)", value=180_000, step=10_000, min_value=0,
+            help="Real-dollar contributions per year while you're saving. Grows with "
+                 "CPI along each historical path so purchasing power stays constant.")
+        T = st.slider(
+            "Years saving S (T)", 0.0, 30.0, 5.0, step=1.0,
+            help="After T years the savings rate switches from S to S2.")
+        S2 = st.number_input(
+            "Savings after T (S2 $/yr)", value=30_000, step=5_000, min_value=0,
+            help="Real-dollar savings rate once you stop saving at the higher rate. "
+                 "Set to 0 if you'll stop saving entirely.")
 
-    st.header("Horizon")
-    max_years = st.slider("Max horizon (years)", 5, 50, 30)
-    checkpoints_str = st.text_input(
-        "Checkpoints (years, comma-separated)", "5,10,15,20,25,30")
+    # STRATEGIES — second-most-tweaked
+    with st.expander("Strategies", expanded=True):
+        show_static = st.checkbox(
+            "static", value=True,
+            help="Set leverage at day 0, never rebalance. Drifts down naturally as "
+                 "DCA dilutes leverage. Architecturally the cleanest, lowest tail risk.")
+        show_relever = st.checkbox(
+            "relever (monthly)", value=True,
+            help="Monthly re-lever back to the target. Captures leverage on every "
+                 "contribution dollar but most exposed to bootstrap path-overfitting.")
+        show_dd = st.checkbox(
+            "dd_decay (drawdown decay)", value=True,
+            help="Targets T_init initially; ratchets target DOWN by F × max-drawdown "
+                 "observed (lifetime). Pareto-dominates wealth/time decay per project §5d.")
+        dd_F = st.slider(
+            "dd_decay F (decay factor)", 0.5, 3.0, 1.5, step=0.1,
+            help="target = max(1.0, T_init − F × max_dd_observed). Higher F = more "
+                 "aggressive deleveraging once a drawdown is observed. Default 1.5.")
 
-    st.header("Bootstrap")
-    n_bootstrap = st.slider("# synthetic paths", 500, 5000, 1000, step=500)
-    boot_target_pct = st.slider("Target call rate (%)", 0.5, 5.0, 1.0, step=0.5)
-    block_years = st.slider("Block size (years)", 1.0, 5.0, 1.0, step=0.5)
-    seed = st.number_input("Bootstrap seed", value=42, step=1)
+    # GOALS — for probability/target-wealth questions
+    with st.expander("Goals & targets"):
+        target_wealth_M = st.number_input(
+            "Target wealth ($M)", value=3.0, step=0.5, min_value=0.1,
+            help="Used by the 'Probability of reaching ≥ $X by year Y' panel and "
+                 "marked on the histogram with a red dashed line.")
+        target_year = st.slider(
+            "Target year", 5, 30, 15,
+            help="Year at which to compute P(wealth ≥ target).")
+        cap_enabled = st.toggle(
+            "Stop levering up above a wealth cap", value=True,
+            help="When ON, every strategy permanently stops adding leverage the moment "
+                 "real wealth crosses the threshold below. Once latched, doesn't toggle "
+                 "off if wealth dips below.")
+        cap_wealth_M = st.number_input(
+            "Stop-levering threshold (real $M)", value=3.0, step=0.5, min_value=0.1,
+            help="Above this real-wealth threshold, no new leverage is taken. Below, "
+                 "the strategy operates normally. Default matches Target wealth.")
 
-    st.header("Drawdown stretch")
-    stretch_F = st.slider("Drawdown stretch factor F", 1.0, 1.5, 1.0, step=0.05,
-                          help="F=1.0 = no stretch. F=1.2 = every historical "
-                               "drawdown 20% deeper. Adds a third safety bar.")
+    # SAFETY — bootstrap + stretch tuning, less often touched
+    with st.expander("Safety calibration"):
+        n_bootstrap = st.slider(
+            "# synthetic paths", 500, 5000, 1000, step=500,
+            help="Block-bootstrap synthetic paths used for the 'is this leverage really "
+                 "safe?' check. More = tighter call-rate measurement but slower.")
+        boot_target_pct = st.slider(
+            "Target call rate (%)", 0.5, 5.0, 1.0, step=0.5,
+            help="Acceptable synthetic margin-call rate when picking 'bootstrap-safe' "
+                 "leverage targets. Lower = more conservative.")
+        block_years = st.slider(
+            "Block size (years)", 1.0, 5.0, 1.0, step=0.5,
+            help="Length of each random block sampled from history. 1y is default; "
+                 "2y is more stressful (preserves crisis dynamics).")
+        seed = st.number_input(
+            "Bootstrap seed", value=42, step=1,
+            help="RNG seed for the bootstrap. Same seed = same exact synthetic paths.")
+        stretch_F = st.slider(
+            "Drawdown stretch factor F", 1.0, 1.5, 1.0, step=0.05,
+            help="F=1.0 = no stretch. F=1.2 = every historical drawdown 20% deeper. "
+                 "Adds a third safety bar (T_stress) when > 1.")
 
-    st.header("Strategies")
-    show_static = st.checkbox("static", value=True)
-    show_relever = st.checkbox("relever (monthly)", value=True)
-    show_dd = st.checkbox("dd_decay (drawdown decay)", value=True)
-    dd_F = st.slider("dd_decay F (decay factor)", 0.5, 3.0, 1.5, step=0.1,
-                     help="target = max(1.0, T_init - F × max_dd_observed). "
-                          "Higher F = more aggressive deleveraging on drawdowns.")
+    # HORIZON — rarely changed
+    with st.expander("Horizon & checkpoints"):
+        max_years = st.slider(
+            "Max horizon (years)", 5, 50, 30,
+            help="Longest projection horizon. Larger = slower, tighter on memory.")
+        checkpoints_str = st.text_input(
+            "Checkpoints (years, comma-separated)", "5,10,15,20,25,30",
+            help="Years at which to report percentiles, leverage, and probabilities.")
 
-    st.header("Display")
-    real_dollars = st.toggle("Show in real $ (today's purchasing power)", value=True,
-                             help="Off = nominal $ at each year along each path.")
-
-    st.header("Goal probabilities")
-    target_wealth_M = st.number_input("Target wealth ($M)", value=3.0, step=0.5,
-                                       min_value=0.1)
-    target_year = st.slider("Target year", 5, 30, 15)
-
-    st.header("Stop levering up at wealth")
-    cap_enabled = st.toggle("Stop adding leverage above this wealth", value=True,
-                            help="When ON, every strategy stops levering up the moment "
-                                 "real wealth crosses the threshold below. The flag is "
-                                 "permanent — it doesn't toggle off if wealth dips below "
-                                 "after crossing.")
-    cap_wealth_M = st.number_input("Stop-levering threshold (real $M)", value=3.0,
-                                    step=0.5, min_value=0.1)
+    # DISPLAY
+    with st.expander("Display"):
+        real_dollars = st.toggle(
+            "Show in real $ (today's purchasing power)", value=True,
+            help="Off = nominal $ at each year along each path. Calibration & safety "
+                 "panels stay in real terms regardless.")
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +613,6 @@ if "results" in st.session_state:
 
     # --- Line chart of p50 across strategies (static matplotlib, no zoom) ---
     st.subheader(f"p50 trajectory ({mode_label}, in $M)")
-    import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(8, 4))
     for name in strategy_names:
         ys, vals = [], []
@@ -608,7 +684,7 @@ if "results" in st.session_state:
 
     # --- Probability of reaching target wealth ---
     st.subheader(
-        f"Probability of reaching ≥ ${p.get('_target_M', target_wealth_M):.1f}M by year {target_year}"
+        f"Probability of reaching ≥ ${target_wealth_M:.1f}M by year {target_year}"
     )
     target_dollars = float(target_wealth_M) * 1e6
     prob_rows = []
@@ -646,7 +722,6 @@ if "results" in st.session_state:
         default=[s for s in strategy_names if s in ("unlev", "dd_decay")],
     )
     if hist_strats:
-        import matplotlib.pyplot as plt
         # Gather all strategies' clipped data first so we can use SHARED bin
         # edges across them (same bin widths → bar heights are comparable).
         clipped = []
@@ -696,7 +771,8 @@ if "results" in st.session_state:
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
     # --- p10/p90 fan chart for one strategy ---
-    st.subheader(f"Wealth fan (p10 / p50 / p90), {mode_label}")
+    cap_state = "cap on" if res.get("cap_enabled") else "cap off"
+    st.subheader(f"Wealth fan (p10 / p50 / p90), {mode_label} — {cap_state}")
     strategy_to_fan = st.selectbox(
         "Choose a strategy to display the fan",
         options=strategy_names,
