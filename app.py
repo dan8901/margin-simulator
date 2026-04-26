@@ -553,6 +553,58 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                                 init_base_kind=BASE_KIND_FOR_RECAL.get(kind),
                                 init_strat_idx=0)
 
+    # meta_recal: calibrate all four base candidates and pick argmax(T_rec).
+    # The winner's index in META_KINDS becomes init_strat_idx so the
+    # years-before-first-recal phase applies the chosen strategy's logic.
+    META_KINDS = ["static", "dd_decay", "adaptive_dd", "hybrid"]   # MUST match the meta_kinds ordering above
+    meta_strategies = [(n, s) for n, s in strategies if s["kind"] == "meta_recal"]
+    for name, spec in meta_strategies:
+        F = spec.get("F", 1.5)
+        per_base = {}
+        for base_kind in META_KINDS:
+            T_h = find_max_safe_T_grid(ret_c, tsy_c, cpi_c, base_kind, 0.0,
+                                        C, S, T, S2, max_days, avail=avail_c,
+                                        F=F, cap_real=cap_real, wealth_X=wealth_X,
+                                        **overlay_kw)
+            T_bo = find_max_safe_T_grid(ret_b, tsy_b, cpi_b, base_kind, boot_target,
+                                         C, S, T, S2, max_days, F=F,
+                                         cap_real=cap_real, wealth_X=wealth_X,
+                                         **overlay_kw)
+            if ret_s is not None:
+                T_st = find_max_safe_T_grid(ret_s, tsy_c, cpi_c, base_kind, 0.0,
+                                             C, S, T, S2, max_days, avail=avail_c,
+                                             F=F, cap_real=cap_real,
+                                             wealth_X=wealth_X, **overlay_kw)
+            else:
+                T_st = float("inf")
+            per_base[base_kind] = dict(T_hist=T_h, T_boot=T_bo, T_stress=T_st,
+                                        T_rec=min(T_h, T_bo, T_st))
+
+        T_recs = [per_base[k]["T_rec"] for k in META_KINDS]
+        winner_idx = int(np.argmax(T_recs))
+        winner_kind = META_KINDS[winner_idx]
+        T_rec = T_recs[winner_idx]
+        winner = per_base[winner_kind]
+
+        # Strategy-level boot rate at the chosen T (for display only)
+        boot_at_hist = call_rate(ret_b, tsy_b, cpi_b, "meta_recal", T_rec,
+                                  C, S, T, S2, max_days, F=F, cap_real=cap_real,
+                                  wealth_X=wealth_X, **overlay_kw,
+                                  **recal_kw_for(name),
+                                  init_strat_idx=winner_idx)
+
+        calibrated[name] = dict(
+            spec=spec,
+            T_hist=winner["T_hist"],
+            boot_at_hist=boot_at_hist,
+            T_boot=winner["T_boot"],
+            T_stress=(winner["T_stress"] if ret_s is not None else None),
+            T_rec=T_rec,
+            init_base_kind=winner_kind,
+            init_strat_idx=winner_idx,
+            per_base=per_base,
+        )
+
     # cpi factor per path/day (used for nominal conversion)
     cpi_factor = cpi_h / cpi_h[:, 0:1]
 
