@@ -43,9 +43,14 @@ ret_b, tsy_b, cpi_b = build_bootstrap_paths(
 ret_s = stretch_returns(ret_c, STRETCH_F)
 
 
+RECAL_PERIOD_MONTHS = 60   # match app.py default
+SCORE_HORIZON_DAYS = min(RECAL_PERIOD_MONTHS * 21, max_days)
+
+
 def calibrate_base(kind):
-    """Returns (T_rec, score) where score = p50 real terminal wealth on
-    calibration paths at T_rec. Mirrors app.py compute()'s meta_recal block."""
+    """Returns (T_rec, score) where score = p50 real wealth on calibration
+    paths at T_rec over the MYOPIC horizon (next recal event, not full
+    horizon). Mirrors app.py compute()'s meta_recal block (v4)."""
     T_h = find_max_safe_T_grid(ret_c, tsy_c, cpi_c, kind, 0.0,
                                 C, S, T_yrs, S2, max_days, avail=avail_c,
                                 F=F, wealth_X=WEALTH_X)
@@ -59,8 +64,10 @@ def calibrate_base(kind):
 
     real_eq, called, _, _ = simulate(
         ret_c, tsy_c, cpi_c, kind, T_rec,
-        C, S, T_yrs, S2, max_days, avail=avail_c, F=F, wealth_X=WEALTH_X)
-    terminal = real_eq[:, max_days]
+        C, S, T_yrs, S2, SCORE_HORIZON_DAYS,
+        avail=np.minimum(avail_c, SCORE_HORIZON_DAYS),
+        F=F, wealth_X=WEALTH_X)
+    terminal = real_eq[:, SCORE_HORIZON_DAYS]
     valid = ~(np.isnan(terminal) | called)
     score = float(np.nanpercentile(terminal[valid], 50)) if valid.any() else float("-inf")
     return T_rec, score

@@ -993,7 +993,7 @@ v2 picked `adaptive_dd` @ 1.496x for the user's scenario, giving
 `wealth_X` — leverage stayed at ~1.3x even at year 30 when median
 wealth was already $14M, well past the user's $3M unlever target.
 
-**v3 (current): argmax(p50 terminal wealth) over wealth-aware candidates
+**v3: argmax(p50 terminal wealth) over wealth-aware candidates
 {static, hybrid, adaptive_hybrid}.** Drops `dd_decay` and `adaptive_dd`
 from the candidate set because they ignore `wealth_X`. The three
 remaining candidates all naturally drift to floor at the wealth target
@@ -1029,17 +1029,52 @@ table values. As the user's wealth grows, the cell T_max naturally
 declines (because the cell scores assume wealth_X kicks in), so the
 recal lifts get smaller over time and approach the floor near $3M.
 
+**v4 (current): myopic score — p50 wealth at NEXT RECAL EVENT, not full
+horizon.** v3's full-horizon score commits to a 30y EV view at every
+recal, which doesn't match the user's actual mental model of "decide
+what's best for the next 5y, re-evaluate later." v4 changes the score
+horizon from `h_days` (cell remaining) to `min(recal_period_days,
+h_days)`. Last-segment cells (where remaining < recal_period) still
+score at terminal — degrades correctly.
+
+Implementation: `compute_recal_table` accepts `score_horizon_days`
+(None = full horizon, int = myopic). `app.py` passes
+`score_horizon_days = recal_period_days`. The meta_recal T_init score
+calc in app.py mirrors (uses `min(recal_period_days, max_days)`).
+
+Empirical impact for the user's primary scenario (5y recal period):
+
+| Base | T_rec | v3 score (p50@30y) | v4 score (p50@5y) |
+|---|---|---|---|
+| static | 2.025x | $10.67M | $1.43M |
+| hybrid | 1.661x | $12.52M (winner) | $1.46M (winner) |
+| adaptive_hybrid | 1.661x | $12.40M | $1.45M |
+
+Margins are tighter under v4 (~2% spread vs ~17% at full horizon). This
+means meta_recal is MORE sensitive to small EV differences and may switch
+base strategies between recal events as cell state evolves. That's the
+design intent — locally optimal picks per segment.
+
+Year-0 winner is still `hybrid` for the user's scenario. The picks at
+later years (e.g., year 5/10/15) are now driven by 5y-window EV
+expectations from those cells, not full-remaining-horizon EV. Empirically
+should: pick higher-T strategies when there's heavy DCA still flowing
+and a long way to wealth_X (front-loaded EV), and shift toward more
+conservative picks as wealth approaches wealth_X (where EV plateaus).
+
+Trade-off vs v3: locally optimal ≠ globally optimal. A myopic pick can
+"burn through" a strategy's edge in one segment and leave a worse state
+for future segments. Empirical question whether this matters in practice;
+TBD by running both modes and comparing 30y wealth distributions.
+
 Notes for future work:
 - This is an EV pick, not a tail-aware pick. Could expose percentile
   as a parameter (p25 or p10 for risk-averse, p50 for neutral, mean for
   aggressive).
-- Currently meta_recal can still SWITCH base strategies between recals
-  (e.g., year 0 hybrid → year 10 static if scores favor it). User can
-  verify which base is active at each recal by inspecting the JIT
-  state (not yet exposed in the UI).
-- The recal mechanism's value-add over plain hybrid is small early
-  (years 0-15: meta_recal ≈ hybrid because v3 picks hybrid at year 0)
-  and grows in years 20-30 as recal lifts compound.
+- Currently meta_recal can still SWITCH base strategies between recals.
+  Worth visualizing in the UI which base is active in which segment.
+- Could expose `score_horizon_mode` ∈ {myopic, sliding_window, full}
+  as a sidebar option for users who want to compare.
 
 ### Verified empirical impact (user's primary scenario)
 

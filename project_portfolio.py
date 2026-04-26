@@ -221,34 +221,42 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
                          kind="static", F=1.5, wealth_X=float("inf"),
                          hist_target=0.0, hi=3.0, coarse_n=10, fine_n=10,
                          ret_b=None, tsy_b=None, cpi_b=None, boot_target=0.01,
-                         ret_s=None, stretch_F=1.0):
+                         ret_s=None, stretch_F=1.0,
+                         score_horizon_days=None):
     """Pre-compute T_max(E_real, H_remaining_years) for `kind` base strategy.
 
     For each (E_real, H_rem) cell, takes the **well-defended** T_max =
     min(T_hist@0%, T_boot@boot_target, T_stress@0%-stretched). Same
     safety architecture as the main app's calibration.
 
-    Also returns a score table: score[i, j] = p50 real terminal wealth on
-    the calibration paths when running `kind` at T_max from cell (i, j).
-    Used by meta_recal to pick the candidate with highest expected EV
-    (instead of highest T).
+    Also returns a score table: score[i, j] = p50 real wealth on the
+    calibration paths when running `kind` at T_max from cell (i, j).
+    Used by meta_recal to pick the candidate with highest expected EV.
+
+    `score_horizon_days` controls the score's evaluation horizon:
+    - None (default): score = wealth at full cell horizon (h_days). Picks
+      based on full-remaining-horizon EV.
+    - int N: score = wealth at min(N, h_days). Used by meta_recal in
+      "myopic" mode to pick based on the NEXT RECAL EVENT, matching the
+      user's mental model of re-deciding strategy every recal_period.
 
     Args:
         ret_c, tsy_c, cpi_c, avail_c: historical (calibration) paths
         S2: real $/yr DCA from re-cal onward
         e_grid, h_grid_years: cell grids
-        kind: base strategy (static / dd_decay / adaptive_dd / hybrid)
+        kind: base strategy (static / dd_decay / adaptive_dd / hybrid / etc.)
         F, wealth_X: strategy params
         hist_target: target call rate on historical paths (default 0%)
         ret_b, tsy_b, cpi_b: bootstrap paths (None = skip bootstrap defense)
         boot_target: target bootstrap call rate (default 1%)
         ret_s: stretched calibration paths (None = skip stretch defense)
         stretch_F: stretch factor (used only for description; precomputed in ret_s)
+        score_horizon_days: see above
 
     Returns:
         t_table[i, j]     = well-defended T_max for cell (e_grid[i], h_grid_years[j])
-        score_table[i, j] = p50 real terminal wealth at that T_max (np.nan
-                            if no eligible calibration paths reach the cell's horizon)
+        score_table[i, j] = p50 real wealth at that T_max over the score
+                            horizon (np.nan if no eligible calibration paths)
     """
     n_e = len(e_grid)
     n_h = len(h_grid_years)
@@ -316,15 +324,20 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
             T_safe = min(T_hist, T_boot, T_stress)
             t_table[i, j] = T_safe
 
-            # Score = p50 real terminal wealth at T_safe on calibration paths.
-            # Captures expected EV for picking among candidates (used by
-            # meta_recal). Survivors-only is fine: called paths get NaN
-            # terminal_eq, which np.nanpercentile drops.
+            # Score = p50 real wealth at T_safe over `sh_days`. Default is
+            # full cell horizon (h_days); meta_recal in myopic mode passes
+            # score_horizon_days=recal_period_days, capturing wealth at the
+            # next recal event instead of terminal.
+            if score_horizon_days is not None:
+                sh_days = min(int(score_horizon_days), h_days)
+            else:
+                sh_days = h_days
             real_eq, called_score, _, _ = simulate(
                 ret_h, tsy_h, cpi_h, kind, T_safe,
                 float(e0), float(S2), 1e9, float(S2),
-                h_days, avail=avail_h_e, F=F, wealth_X=wealth_X)
-            terminal = real_eq[:, h_days]
+                sh_days, avail=np.minimum(avail_h_e, sh_days),
+                F=F, wealth_X=wealth_X)
+            terminal = real_eq[:, sh_days]
             valid = ~(np.isnan(terminal) | called_score)
             if valid.any():
                 score_table[i, j] = float(np.nanpercentile(terminal[valid], 50))
@@ -335,12 +348,14 @@ def compute_recal_tables_multi(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid,
                                 h_grid_years, kinds, F=1.5, wealth_X=float("inf"),
                                 hist_target=0.0, coarse_n=8, fine_n=8,
                                 ret_b=None, tsy_b=None, cpi_b=None,
-                                boot_target=0.01, ret_s=None, stretch_F=1.0):
+                                boot_target=0.01, ret_s=None, stretch_F=1.0,
+                                score_horizon_days=None):
     """Compute well-defended recal lookup tables for multiple base strategies.
 
     Returns:
         t_3d[s, i, j]     = T_max table for strategy `kinds[s]` at cell (i, j)
-        score_3d[s, i, j] = p50 real terminal wealth at that T_max (for meta_recal pick)
+        score_3d[s, i, j] = p50 real wealth at that T_max over the score
+                            horizon (see compute_recal_table for details)
     """
     n_s = len(kinds)
     n_e = len(e_grid)
@@ -353,7 +368,8 @@ def compute_recal_tables_multi(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid,
             kind=kind, F=F, wealth_X=wealth_X, hist_target=hist_target,
             coarse_n=coarse_n, fine_n=fine_n,
             ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b, boot_target=boot_target,
-            ret_s=ret_s, stretch_F=stretch_F)
+            ret_s=ret_s, stretch_F=stretch_F,
+            score_horizon_days=score_horizon_days)
     return t_3d, score_3d
 
 

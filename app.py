@@ -437,9 +437,13 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         # the rest of the app: hist 0% + bootstrap ≤ boot_target + stretch ≤ 0%.
         # Strategy-level call rate is a consequence of multi-event exposure (~3%
         # at boot_target=1% over a 30y/5y schedule).
-        # per_strat_tables[kind] = (t_table, score_table) where score is
-        # p50 real terminal wealth at the cell's well-defended T_max.
-        # meta_recal uses the score table to pick among candidates.
+        # per_strat_tables[kind] = (t_table, score_table). Score is p50
+        # real wealth at the cell's well-defended T_max evaluated over
+        # `recal_period_days` (myopic mode) — captures expected wealth at
+        # the next recal event, matching the user's "decide for the next
+        # chunk" mental model. For the last segment (cell horizon <
+        # recal_period), the score correctly degrades to terminal wealth.
+        score_horizon_days_local = int(recal_period_months * 21)
         per_strat_tables = {}
         for kind in recal_strategies_needed:
             per_strat_tables[kind] = compute_recal_table(
@@ -448,7 +452,8 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                 hist_target=0.0, coarse_n=8, fine_n=8,
                 ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b,
                 boot_target=boot_target,
-                ret_s=ret_s_for_recal, stretch_F=stretch_F)
+                ret_s=ret_s_for_recal, stretch_F=stretch_F,
+                score_horizon_days=score_horizon_days_local)
         # Build 3D meta tables if needed (fixed order static / hybrid / adaptive_hybrid).
         # Wealth-aware candidates only — see recal_strategies_needed comment above.
         if needs_meta:
@@ -594,13 +599,17 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                 T_st = float("inf")
             T_rec_base = min(T_h, T_bo, T_st)
 
-            # Score = p50 real terminal wealth on calibration paths at T_rec_base.
-            # Same metric as the per-cell score table for recal events.
+            # Score = p50 real wealth on calibration paths at T_rec_base
+            # over the myopic horizon (next recal event), mirroring the
+            # per-cell score table at recal events. Captures "best for
+            # the next chunk", not best for full 30y.
+            score_horizon = min(int(recal_period_months * 21), max_days)
             real_eq_b, called_b_score, _, _ = simulate(
                 ret_c, tsy_c, cpi_c, base_kind, T_rec_base,
-                C, S, T, S2, max_days, avail=avail_c, F=F,
+                C, S, T, S2, score_horizon,
+                avail=np.minimum(avail_c, score_horizon), F=F,
                 cap_real=cap_real, wealth_X=wealth_X, **overlay_kw)
-            terminal = real_eq_b[:, max_days]
+            terminal = real_eq_b[:, score_horizon]
             valid = ~(np.isnan(terminal) | called_b_score)
             score = float(np.nanpercentile(terminal[valid], 50)) if valid.any() else float("-inf")
 
