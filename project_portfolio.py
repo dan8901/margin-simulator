@@ -228,6 +228,11 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
     min(T_hist@0%, T_boot@boot_target, T_stress@0%-stretched). Same
     safety architecture as the main app's calibration.
 
+    Also returns a score table: score[i, j] = p50 real terminal wealth on
+    the calibration paths when running `kind` at T_max from cell (i, j).
+    Used by meta_recal to pick the candidate with highest expected EV
+    (instead of highest T).
+
     Args:
         ret_c, tsy_c, cpi_c, avail_c: historical (calibration) paths
         S2: real $/yr DCA from re-cal onward
@@ -241,11 +246,14 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
         stretch_F: stretch factor (used only for description; precomputed in ret_s)
 
     Returns:
-        t_table[i, j] = well-defended T_max for cell (e_grid[i], h_grid_years[j]).
+        t_table[i, j]     = well-defended T_max for cell (e_grid[i], h_grid_years[j])
+        score_table[i, j] = p50 real terminal wealth at that T_max (np.nan
+                            if no eligible calibration paths reach the cell's horizon)
     """
     n_e = len(e_grid)
     n_h = len(h_grid_years)
     t_table = np.full((n_e, n_h), 1.0, dtype=np.float64)
+    score_table = np.full((n_e, n_h), np.nan, dtype=np.float64)
 
     full_max_days = ret_c.shape[1] - 1
     use_boot = ret_b is not None and tsy_b is not None and cpi_b is not None
@@ -305,8 +313,22 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
                     h_days, avail=avail_h_e, hi=hi, F=F, wealth_X=wealth_X,
                     coarse_n=coarse_n, fine_n=fine_n,
                 )
-            t_table[i, j] = min(T_hist, T_boot, T_stress)
-    return t_table
+            T_safe = min(T_hist, T_boot, T_stress)
+            t_table[i, j] = T_safe
+
+            # Score = p50 real terminal wealth at T_safe on calibration paths.
+            # Captures expected EV for picking among candidates (used by
+            # meta_recal). Survivors-only is fine: called paths get NaN
+            # terminal_eq, which np.nanpercentile drops.
+            real_eq, called_score, _, _ = simulate(
+                ret_h, tsy_h, cpi_h, kind, T_safe,
+                float(e0), float(S2), 1e9, float(S2),
+                h_days, avail=avail_h_e, F=F, wealth_X=wealth_X)
+            terminal = real_eq[:, h_days]
+            valid = ~(np.isnan(terminal) | called_score)
+            if valid.any():
+                score_table[i, j] = float(np.nanpercentile(terminal[valid], 50))
+    return t_table, score_table
 
 
 def compute_recal_tables_multi(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid,
@@ -314,19 +336,25 @@ def compute_recal_tables_multi(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid,
                                 hist_target=0.0, coarse_n=8, fine_n=8,
                                 ret_b=None, tsy_b=None, cpi_b=None,
                                 boot_target=0.01, ret_s=None, stretch_F=1.0):
-    """Compute well-defended recal lookup tables for multiple base strategies."""
+    """Compute well-defended recal lookup tables for multiple base strategies.
+
+    Returns:
+        t_3d[s, i, j]     = T_max table for strategy `kinds[s]` at cell (i, j)
+        score_3d[s, i, j] = p50 real terminal wealth at that T_max (for meta_recal pick)
+    """
     n_s = len(kinds)
     n_e = len(e_grid)
     n_h = len(h_grid_years)
-    out = np.full((n_s, n_e, n_h), 1.0, dtype=np.float64)
+    t_3d = np.full((n_s, n_e, n_h), 1.0, dtype=np.float64)
+    score_3d = np.full((n_s, n_e, n_h), np.nan, dtype=np.float64)
     for s, kind in enumerate(kinds):
-        out[s] = compute_recal_table(
+        t_3d[s], score_3d[s] = compute_recal_table(
             ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
             kind=kind, F=F, wealth_X=wealth_X, hist_target=hist_target,
             coarse_n=coarse_n, fine_n=fine_n,
             ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b, boot_target=boot_target,
             ret_s=ret_s, stretch_F=stretch_F)
-    return out
+    return t_3d, score_3d
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +392,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                    rate_threshold, rate_factor,
                    recal_period_days, t_recal_table, e_recal_grid,
                    h_recal_grid_days,
-                   t_recal_tables_meta, meta_strategy_codes,
+                   t_recal_tables_meta, meta_score_tables, meta_strategy_codes,
                    init_strat_idx):
     """JIT-compiled per-day, per-path inner loop. Avoids temporary array
     allocations entirely. kind_code: 0=static, 1=relever, 2=dd_decay,
@@ -842,15 +870,20 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                             if dh_v < best_dh:
                                 best_dh = dh_v
                                 h_idx = hh
-                        # Pick strategy with highest T_max for this cell
-                        n_meta = t_recal_tables_meta.shape[0]
+                        # Pick strategy with highest expected p50 terminal
+                        # wealth (score) for this cell, breaking ties by index.
+                        # NaN scores are skipped (cell has no eligible paths).
+                        n_meta = meta_score_tables.shape[0]
                         best_s = 0
-                        best_T = t_recal_tables_meta[0, e_idx, h_idx]
+                        best_score = meta_score_tables[0, e_idx, h_idx]
                         for ss in range(1, n_meta):
-                            t_s = t_recal_tables_meta[ss, e_idx, h_idx]
-                            if t_s > best_T:
-                                best_T = t_s
+                            sc = meta_score_tables[ss, e_idx, h_idx]
+                            # NaN-safe argmax: NaN never wins
+                            if sc == sc and (best_score != best_score or sc > best_score):
+                                best_score = sc
                                 best_s = ss
+                        # Use the chosen strategy's well-defended T_max
+                        best_T = t_recal_tables_meta[best_s, e_idx, h_idx]
                         if best_T < floor:
                             best_T = floor
                         T_active[k] = best_T
@@ -955,7 +988,8 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
              rate_threshold=float("inf"), rate_factor=0.0,
              recal_period_days=0, t_recal_table=None,
              e_recal_grid=None, h_recal_grid_days=None,
-             t_recal_tables_meta=None, meta_strategy_codes=None,
+             t_recal_tables_meta=None, meta_score_tables=None,
+             meta_strategy_codes=None,
              init_strat_idx=0):
     """Wrapper around the JIT inner loop. Coerces `kind` string to int and
     sets defaults. Returns (real_eq, called, peak_lev, lev_at_cp).
@@ -1000,6 +1034,10 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
         t_recal_tables_meta = np.zeros((1, 1, 1), dtype=np.float64)
     elif t_recal_tables_meta.dtype != np.float64:
         t_recal_tables_meta = t_recal_tables_meta.astype(np.float64)
+    if meta_score_tables is None:
+        meta_score_tables = np.zeros((1, 1, 1), dtype=np.float64)
+    elif meta_score_tables.dtype != np.float64:
+        meta_score_tables = meta_score_tables.astype(np.float64)
     if meta_strategy_codes is None:
         meta_strategy_codes = np.zeros(1, dtype=np.int64)
     elif meta_strategy_codes.dtype != np.int64:
@@ -1013,7 +1051,8 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                           float(rate_factor),
                           int(recal_period_days), t_recal_table,
                           e_recal_grid, h_recal_grid_days,
-                          t_recal_tables_meta, meta_strategy_codes,
+                          t_recal_tables_meta, meta_score_tables,
+                          meta_strategy_codes,
                           int(init_strat_idx))
 
 
@@ -1023,7 +1062,8 @@ def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
               rate_threshold=float("inf"), rate_factor=0.0,
               recal_period_days=0, t_recal_table=None,
               e_recal_grid=None, h_recal_grid_days=None,
-              t_recal_tables_meta=None, meta_strategy_codes=None,
+              t_recal_tables_meta=None, meta_score_tables=None,
+              meta_strategy_codes=None,
               init_strat_idx=0):
     _, called, _, _ = simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                             avail=avail, F=F, cap_real=cap_real, wealth_X=wealth_X,
@@ -1035,6 +1075,7 @@ def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                             e_recal_grid=e_recal_grid,
                             h_recal_grid_days=h_recal_grid_days,
                             t_recal_tables_meta=t_recal_tables_meta,
+                            meta_score_tables=meta_score_tables,
                             meta_strategy_codes=meta_strategy_codes,
                             init_strat_idx=init_strat_idx)
     return float(called.mean())
@@ -1051,7 +1092,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                         rate_threshold, rate_factor,
                         recal_period_days, t_recal_table, e_recal_grid,
                         h_recal_grid_days,
-                        t_recal_tables_meta, meta_strategy_codes,
+                        t_recal_tables_meta, meta_score_tables, meta_strategy_codes,
                         init_strat_idx):
     """Vectorized over T. Runs all T_inits values simultaneously, sharing the
     same per-path data. Returns `called[K, T_count]` only — skips real_eq,
@@ -1514,14 +1555,16 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                 if dh_v < best_dh:
                                     best_dh = dh_v
                                     h_idx = hh
-                            n_meta = t_recal_tables_meta.shape[0]
+                            # Pick by p50 terminal wealth score (NaN-safe).
+                            n_meta = meta_score_tables.shape[0]
                             best_s = 0
-                            best_T = t_recal_tables_meta[0, e_idx, h_idx]
+                            best_score = meta_score_tables[0, e_idx, h_idx]
                             for ss in range(1, n_meta):
-                                t_s = t_recal_tables_meta[ss, e_idx, h_idx]
-                                if t_s > best_T:
-                                    best_T = t_s
+                                sc = meta_score_tables[ss, e_idx, h_idx]
+                                if sc == sc and (best_score != best_score or sc > best_score):
+                                    best_score = sc
                                     best_s = ss
+                            best_T = t_recal_tables_meta[best_s, e_idx, h_idx]
                             if best_T < floor:
                                 best_T = floor
                             T_active[k, t] = best_T
@@ -1608,7 +1651,8 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
                           rate_threshold=float("inf"), rate_factor=0.0,
                           recal_period_days=0, t_recal_table=None,
                           e_recal_grid=None, h_recal_grid_days=None,
-                          t_recal_tables_meta=None, meta_strategy_codes=None,
+                          t_recal_tables_meta=None, meta_score_tables=None,
+                          meta_strategy_codes=None,
                           init_strat_idx=0):
     """Two-pass grid search for largest T_init with call rate ≤ target.
 
@@ -1640,6 +1684,10 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
         t_recal_tables_meta = np.zeros((1, 1, 1), dtype=np.float64)
     elif t_recal_tables_meta.dtype != np.float64:
         t_recal_tables_meta = t_recal_tables_meta.astype(np.float64)
+    if meta_score_tables is None:
+        meta_score_tables = np.zeros((1, 1, 1), dtype=np.float64)
+    elif meta_score_tables.dtype != np.float64:
+        meta_score_tables = meta_score_tables.astype(np.float64)
     if meta_strategy_codes is None:
         meta_strategy_codes = np.zeros(1, dtype=np.int64)
     elif meta_strategy_codes.dtype != np.int64:
@@ -1655,7 +1703,8 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
                                      float(rate_factor),
                                      int(recal_period_days), t_recal_table,
                                      e_recal_grid, h_recal_grid_days,
-                                     t_recal_tables_meta, meta_strategy_codes,
+                                     t_recal_tables_meta, meta_score_tables,
+                                     meta_strategy_codes,
                                      int(init_strat_idx))
         return called.mean(axis=0)
 

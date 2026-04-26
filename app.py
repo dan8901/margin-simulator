@@ -434,6 +434,9 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         # the rest of the app: hist 0% + bootstrap ≤ boot_target + stretch ≤ 0%.
         # Strategy-level call rate is a consequence of multi-event exposure (~3%
         # at boot_target=1% over a 30y/5y schedule).
+        # per_strat_tables[kind] = (t_table, score_table) where score is
+        # p50 real terminal wealth at the cell's well-defended T_max.
+        # meta_recal uses the score table to pick among candidates.
         per_strat_tables = {}
         for kind in recal_strategies_needed:
             per_strat_tables[kind] = compute_recal_table(
@@ -443,21 +446,24 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                 ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b,
                 boot_target=boot_target,
                 ret_s=ret_s_for_recal, stretch_F=stretch_F)
-        # Build 3D meta-table if needed (in fixed order static / dd_decay / adaptive_dd / hybrid)
+        # Build 3D meta tables if needed (fixed order static / dd_decay / adaptive_dd / hybrid)
         if needs_meta:
             meta_kinds = ["static", "dd_decay", "adaptive_dd", "hybrid"]
-            t_recal_tables_meta = np.stack([per_strat_tables[k] for k in meta_kinds])
+            t_recal_tables_meta = np.stack([per_strat_tables[k][0] for k in meta_kinds])
+            meta_score_tables = np.stack([per_strat_tables[k][1] for k in meta_kinds])
             meta_strategy_codes = np.array(
                 [{"static": 0, "dd_decay": 2, "adaptive_dd": 9, "hybrid": 4}[k]
                  for k in meta_kinds], dtype=np.int64)
         else:
             t_recal_tables_meta = np.zeros((1, 1, 1), dtype=np.float64)
+            meta_score_tables = np.zeros((1, 1, 1), dtype=np.float64)
             meta_strategy_codes = np.zeros(1, dtype=np.int64)
     else:
         e_recal_grid = np.zeros(1, dtype=np.float64)
         h_recal_grid_days = np.zeros(1, dtype=np.int64)
         per_strat_tables = {}
         t_recal_tables_meta = np.zeros((1, 1, 1), dtype=np.float64)
+        meta_score_tables = np.zeros((1, 1, 1), dtype=np.float64)
         meta_strategy_codes = np.zeros(1, dtype=np.int64)
     recal_period_days = int(recal_period_months * 21)   # ~21 trading days per month
 
@@ -468,17 +474,18 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
             e_recal_grid=e_recal_grid,
             h_recal_grid_days=h_recal_grid_days,
             t_recal_tables_meta=t_recal_tables_meta,
+            meta_score_tables=meta_score_tables,
             meta_strategy_codes=meta_strategy_codes,
         )
         if name == "recal_static":
             kw["t_recal_table"] = per_strat_tables.get("static",
-                np.zeros((1, 1), dtype=np.float64))
+                (np.zeros((1, 1), dtype=np.float64),))[0]
         elif name == "recal_hybrid":
             kw["t_recal_table"] = per_strat_tables.get("hybrid",
-                np.zeros((1, 1), dtype=np.float64))
+                (np.zeros((1, 1), dtype=np.float64),))[0]
         elif name == "recal_adaptive_dd":
             kw["t_recal_table"] = per_strat_tables.get("adaptive_dd",
-                np.zeros((1, 1), dtype=np.float64))
+                (np.zeros((1, 1), dtype=np.float64),))[0]
         else:
             kw["t_recal_table"] = np.zeros((1, 1), dtype=np.float64)
         return kw
@@ -553,7 +560,8 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                                 init_base_kind=BASE_KIND_FOR_RECAL.get(kind),
                                 init_strat_idx=0)
 
-    # meta_recal: calibrate all four base candidates and pick argmax(T_rec).
+    # meta_recal: calibrate all four base candidates and pick the candidate
+    # with the highest expected p50 real terminal wealth (NOT highest T).
     # The winner's index in META_KINDS becomes init_strat_idx so the
     # years-before-first-recal phase applies the chosen strategy's logic.
     META_KINDS = ["static", "dd_decay", "adaptive_dd", "hybrid"]   # MUST match the meta_kinds ordering above
@@ -577,14 +585,26 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                                              wealth_X=wealth_X, **overlay_kw)
             else:
                 T_st = float("inf")
-            per_base[base_kind] = dict(T_hist=T_h, T_boot=T_bo, T_stress=T_st,
-                                        T_rec=min(T_h, T_bo, T_st))
+            T_rec_base = min(T_h, T_bo, T_st)
 
-        T_recs = [per_base[k]["T_rec"] for k in META_KINDS]
-        winner_idx = int(np.argmax(T_recs))
+            # Score = p50 real terminal wealth on calibration paths at T_rec_base.
+            # Same metric as the per-cell score table for recal events.
+            real_eq_b, called_b_score, _, _ = simulate(
+                ret_c, tsy_c, cpi_c, base_kind, T_rec_base,
+                C, S, T, S2, max_days, avail=avail_c, F=F,
+                cap_real=cap_real, wealth_X=wealth_X, **overlay_kw)
+            terminal = real_eq_b[:, max_days]
+            valid = ~(np.isnan(terminal) | called_b_score)
+            score = float(np.nanpercentile(terminal[valid], 50)) if valid.any() else float("-inf")
+
+            per_base[base_kind] = dict(T_hist=T_h, T_boot=T_bo, T_stress=T_st,
+                                        T_rec=T_rec_base, score=score)
+
+        scores = [per_base[k]["score"] for k in META_KINDS]
+        winner_idx = int(np.argmax(scores))
         winner_kind = META_KINDS[winner_idx]
-        T_rec = T_recs[winner_idx]
         winner = per_base[winner_kind]
+        T_rec = winner["T_rec"]
 
         # Strategy-level boot rate at the chosen T (for display only)
         boot_at_hist = call_rate(ret_b, tsy_b, cpi_b, "meta_recal", T_rec,
