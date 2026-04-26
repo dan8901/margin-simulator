@@ -241,6 +241,16 @@ with st.sidebar:
             help="Above this real-wealth threshold, no new leverage is taken. Below, "
                  "the strategy operates normally. Default matches Target wealth.")
 
+    # FINANCING — early-period broker bump
+    with st.expander("Financing"):
+        broker_bump_years = st.slider(
+            "Broker-rate years (Tsy+150 bps)", 0, 5, 2, step=1,
+            help="During the first N years, loan interest accrues at the "
+                 "broker margin rate (3M Treasury + 150 bps) instead of the "
+                 "default box-spread rate (Tsy + 15 bps). Models the period "
+                 "before options approval / box-spread setup. Affects T_init "
+                 "calibration and all simulation runs.")
+
     # SAFETY — bootstrap + stretch tuning, less often touched
     with st.expander("Safety calibration"):
         n_bootstrap = st.slider(
@@ -357,7 +367,7 @@ def selected_strategies():
 def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
             boot_target, stretch_F, dd_F, cap_real, wealth_X,
             vol_factor, dip_threshold, dip_bonus, rate_threshold, rate_factor,
-            recal_period_months, wealth_glide_exp,
+            recal_period_months, wealth_glide_exp, broker_bump_days,
             _paths_key, _paths):
     """Cached calibration + projection.
     Cache keys on the leading scalars + tuples; `_paths` is opaque (underscore
@@ -407,6 +417,7 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         rate_threshold=rate_threshold,
         rate_factor=rate_factor,
         wealth_glide_exp=wealth_glide_exp,
+        broker_bump_days=broker_bump_days,
     )
 
     # Identify which strategies need which lookup tables.
@@ -847,6 +858,7 @@ if run or "results" not in st.session_state:
             wealth_X_val = float(wealth_X_M) * 1e6
             dip_threshold_val = float(dip_threshold_pct) / 100.0
             rate_threshold_val = float(rate_threshold_pct) / 100.0
+            broker_bump_days_val = int(broker_bump_years) * TD
             calibrated, proj_results, safety, per_cp, worst, lev_summary, proj_no_cap = compute(
                 C, S, T, S2, max_days, tuple(checkpoints),
                 strategies_tuple, boot_target, stretch_F, dd_F, cap_real_val,
@@ -854,6 +866,7 @@ if run or "results" not in st.session_state:
                 float(vol_factor), dip_threshold_val, float(dip_bonus),
                 rate_threshold_val, float(rate_factor),
                 int(recal_period_months), float(wealth_glide_exp),
+                broker_bump_days_val,
                 paths_key, paths)
             elapsed = time.time() - t0
         st.session_state["results"] = dict(
@@ -871,7 +884,8 @@ if run or "results" not in st.session_state:
             params=dict(C=C, S=S, T=T, S2=S2,
                         max_years=max_years, n_bootstrap=n_bootstrap,
                         boot_target_pct=boot_target_pct, block_years=block_years,
-                        stretch_F=stretch_F, dd_F=dd_F, wealth_X_M=wealth_X_M),
+                        stretch_F=stretch_F, dd_F=dd_F, wealth_X_M=wealth_X_M,
+                        broker_bump_years=int(broker_bump_years)),
             elapsed=elapsed,
         )
 
@@ -1300,7 +1314,6 @@ if "results" in st.session_state:
                     ax.plot([y, y], [vp, vq], color=color, linewidth=2,
                             alpha=0.6, solid_capstyle="butt")
                     ax.scatter([y], [vq], color=color, marker="^", s=40, zorder=5)
-    ax.axhline(1.0, color="grey", linestyle=":", alpha=0.5, label="unleveraged")
     ax.set_xlabel("Years")
     ax.set_ylabel("Leverage (median)")
     ax.set_ylim(bottom=0.95)
