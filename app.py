@@ -108,15 +108,15 @@ with st.sidebar:
     # STRATEGIES — second-most-tweaked
     with st.expander("Strategies", expanded=True):
         show_static = st.checkbox(
-            "static", value=True,
+            "static", value=False,
             help="Set leverage at day 0, never rebalance. Drifts down naturally as "
                  "DCA dilutes leverage. Architecturally the cleanest, lowest tail risk.")
         show_relever = st.checkbox(
-            "relever (monthly)", value=True,
+            "relever (monthly)", value=False,
             help="Monthly re-lever back to the target. Captures leverage on every "
                  "contribution dollar but most exposed to bootstrap path-overfitting.")
         show_dd = st.checkbox(
-            "dd_decay (drawdown decay)", value=True,
+            "dd_decay (drawdown decay)", value=False,
             help="Targets T_init initially; ratchets target DOWN by F × max-drawdown "
                  "observed (lifetime). Pareto-dominates wealth/time decay per project §5d.")
         dd_F = st.slider(
@@ -192,7 +192,7 @@ with st.sidebar:
                  "reach it. Models the 'every N months, re-evaluate' workflow. "
                  "First run takes ~5s to precompute the table.")
         show_recal_hybrid = st.checkbox(
-            "recal_hybrid (re-cal + dd ratchet + wealth glide)", value=False,
+            "recal_hybrid (re-cal + dd ratchet + wealth glide)", value=True,
             help="Like recal_static but uses hybrid-table values + applies "
                  "hybrid logic (dd ratchet + wealth glide) between recals. "
                  "Re-cal events reset state to fresh.")
