@@ -27,13 +27,51 @@ Conventions:
   - Re-lever monthly: only LEVER UP, never sell to deleverage.
 
 Strategies modeled:
-  unlev      — 1.00x, no leverage. Baseline.
-  static     — Set T_init at day 0; never rebalance. Drifts toward 1.0x as
-               DCA dilutes leverage.
-  relever    — Monthly re-lever to T_init.
-  dd_decay   — Drawdown-coupled decay. T_init at day 0; target ratchets DOWN
-               as max observed drawdown grows: target = max(floor, T_init -
-               F * max_dd_observed). F=1.5, floor=1.0.
+  unlev         — 1.00x, no leverage. Baseline.
+  static        — Set T_init at day 0; never rebalance. Drifts toward 1.0x as
+                  DCA dilutes leverage.
+  relever       — Monthly re-lever to T_init.
+  dd_decay      — Drawdown-coupled decay. T_init at day 0; target ratchets DOWN
+                  as max observed drawdown grows: target = max(floor, T_init -
+                  F * max_dd_observed). F=1.5, floor=1.0.
+  wealth_decay  — Current-equity wealth glide. Target linearly interpolates
+                  T_init → floor as real equity grows from C → wealth_X. Uses
+                  CURRENT real equity (not HWM), so target rises again if a
+                  drawdown reduces equity. progress = clip((eq-C)/(wealth_X-C),
+                  0, 1); target = T_init - (T_init - floor) * progress.
+  hybrid        — min(dd_decay_target, wealth_decay_target). Both signals
+                  independently lower target; the more conservative wins.
+  r_hybrid      — Ratcheted hybrid. Same as hybrid but the wealth_progress
+                  only ratchets UP (never decreases), so once target has been
+                  reduced by the wealth-glide it doesn't re-rise on a
+                  drawdown. Strictly-monotonic-down target.
+  vol_hybrid    — Hybrid + volatility haircut. After computing the hybrid
+                  target, subtract `vol_factor * realized_60d_annualized_vol`.
+                  Fires earlier than dd_decay since vol leads drawdown.
+  dip_hybrid    — Hybrid + buy-the-dip floor. When current drawdown crosses
+                  `dip_threshold`, target is floored at `T_init + dip_bonus`
+                  (i.e. allowed to go ABOVE T_init temporarily). Contrarian
+                  to dd_decay's ratchet during deep drawdowns.
+  rate_hybrid   — Hybrid + interest-rate haircut. After hybrid target,
+                  subtract `rate_factor * max(0, tsy_3m - rate_threshold)`.
+                  Deleverages when carry trade economics deteriorate.
+  adaptive_dd   — Drawdown-decay with cushion-coupled F. F_eff = F * (L_now -
+                  1) / (T_init - 1), clamped non-negative. Decay is aggressive
+                  when current leverage is near T_init (small cushion), mild
+                  when already deleveraged (big cushion). Uses an explicit
+                  monotonic-down target ratchet so a transient L_now spike
+                  can lower target but a later drop in L_now never raises it.
+  adaptive_hybrid — adaptive_dd + wealth_decay glide combined.
+                  target = min(adaptive_dd_target, wealth_decay_target).
+                  Inherits adaptive_dd's cushion-coupled F + monotonic ratchet
+                  on the dd component, plus the wealth_X glide enforcing
+                  unlevered at wealth_X.
+  recal_static  — Periodic re-calibration of T_init. Behaves like static
+                  between rebalance events. Every `recal_period_days`, looks
+                  up new T_max from a pre-computed lookup table T*(E_real,
+                  H_remaining) and takes additional loan if new T > current L
+                  (only lever up). Models "every N years, freeze, observe
+                  current state, re-decide optimal target" in algorithmic form.
 
 Usage:
   python project_portfolio.py
@@ -51,7 +89,12 @@ from data_loader import load
 
 TD = 252
 BOX_BPS = 0.0015
-BOX_TAX_BENEFIT = 0.20
+# Box-spread interest creates 60/40 capital losses for the borrower; for a
+# hold-forever SPX investor with no other realized gains, only ~$3k/yr of
+# those losses are usable (vs ordinary income), and even the carryforward
+# option value is uncertain (depends on future realization events). Setting
+# this to 0 is the honest hold-forever assumption.
+BOX_TAX_BENEFIT = 0.00
 CALL_THRESHOLD = 4.0
 REBAL_DAYS = 21
 PATH_DTYPE = np.float32   # halves memory vs float64; ~7-digit precision is plenty
@@ -171,15 +214,161 @@ def build_bootstrap_paths(dates, px, tsy, cpi, max_days, n_paths, block_days, rn
 
 
 # ---------------------------------------------------------------------------
+# Pre-compute lookup table for recal_static
+# ---------------------------------------------------------------------------
+
+def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
+                         kind="static", F=1.5, wealth_X=float("inf"),
+                         hist_target=0.0, hi=3.0, coarse_n=10, fine_n=10,
+                         ret_b=None, tsy_b=None, cpi_b=None, boot_target=0.01,
+                         ret_s=None, stretch_F=1.0):
+    """Pre-compute T_max(E_real, H_remaining_years) for `kind` base strategy.
+
+    For each (E_real, H_rem) cell, takes the **well-defended** T_max =
+    min(T_hist@0%, T_boot@boot_target, T_stress@0%-stretched). Same
+    safety architecture as the main app's calibration.
+
+    Args:
+        ret_c, tsy_c, cpi_c, avail_c: historical (calibration) paths
+        S2: real $/yr DCA from re-cal onward
+        e_grid, h_grid_years: cell grids
+        kind: base strategy (static / dd_decay / adaptive_dd / hybrid)
+        F, wealth_X: strategy params
+        hist_target: target call rate on historical paths (default 0%)
+        ret_b, tsy_b, cpi_b: bootstrap paths (None = skip bootstrap defense)
+        boot_target: target bootstrap call rate (default 1%)
+        ret_s: stretched calibration paths (None = skip stretch defense)
+        stretch_F: stretch factor (used only for description; precomputed in ret_s)
+
+    Returns:
+        t_table[i, j] = well-defended T_max for cell (e_grid[i], h_grid_years[j]).
+    """
+    n_e = len(e_grid)
+    n_h = len(h_grid_years)
+    t_table = np.full((n_e, n_h), 1.0, dtype=np.float64)
+
+    full_max_days = ret_c.shape[1] - 1
+    use_boot = ret_b is not None and tsy_b is not None and cpi_b is not None
+    use_stress = ret_s is not None and stretch_F > 1.0
+
+    for j, h_y in enumerate(h_grid_years):
+        h_days = int(h_y * TD)
+        if h_days > full_max_days:
+            h_days = full_max_days
+
+        # Trim historical paths
+        ret_h = ret_c[:, :h_days + 1]
+        tsy_h = tsy_c[:, :h_days + 1]
+        cpi_h = cpi_c[:, :h_days + 1]
+        avail_h = np.minimum(avail_c, h_days)
+        eligible = avail_h >= h_days
+        if not eligible.any():
+            continue
+        ret_h = ret_h[eligible]
+        tsy_h = tsy_h[eligible]
+        cpi_h = cpi_h[eligible]
+        avail_h_e = avail_h[eligible]
+
+        # Trim bootstrap paths
+        if use_boot:
+            ret_bh = ret_b[:, :h_days + 1]
+            tsy_bh = tsy_b[:, :h_days + 1]
+            cpi_bh = cpi_b[:, :h_days + 1]
+
+        # Trim stretched calibration paths
+        if use_stress:
+            ret_sh = ret_s[:, :h_days + 1]
+            tsy_sh = tsy_c[:, :h_days + 1][eligible]
+            cpi_sh = cpi_c[:, :h_days + 1][eligible]
+            ret_sh = ret_sh[eligible]
+
+        for i, e0 in enumerate(e_grid):
+            T_hist = find_max_safe_T_grid(
+                ret_h, tsy_h, cpi_h, kind, hist_target,
+                float(e0), float(S2), 1e9, float(S2),
+                h_days, avail=avail_h_e, hi=hi, F=F, wealth_X=wealth_X,
+                coarse_n=coarse_n, fine_n=fine_n,
+            )
+            T_boot = float("inf")
+            if use_boot:
+                T_boot = find_max_safe_T_grid(
+                    ret_bh, tsy_bh, cpi_bh, kind, boot_target,
+                    float(e0), float(S2), 1e9, float(S2),
+                    h_days, hi=hi, F=F, wealth_X=wealth_X,
+                    coarse_n=coarse_n, fine_n=fine_n,
+                )
+            T_stress = float("inf")
+            if use_stress:
+                T_stress = find_max_safe_T_grid(
+                    ret_sh, tsy_sh, cpi_sh, kind, hist_target,
+                    float(e0), float(S2), 1e9, float(S2),
+                    h_days, avail=avail_h_e, hi=hi, F=F, wealth_X=wealth_X,
+                    coarse_n=coarse_n, fine_n=fine_n,
+                )
+            t_table[i, j] = min(T_hist, T_boot, T_stress)
+    return t_table
+
+
+def compute_recal_tables_multi(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid,
+                                h_grid_years, kinds, F=1.5, wealth_X=float("inf"),
+                                hist_target=0.0, coarse_n=8, fine_n=8,
+                                ret_b=None, tsy_b=None, cpi_b=None,
+                                boot_target=0.01, ret_s=None, stretch_F=1.0):
+    """Compute well-defended recal lookup tables for multiple base strategies."""
+    n_s = len(kinds)
+    n_e = len(e_grid)
+    n_h = len(h_grid_years)
+    out = np.full((n_s, n_e, n_h), 1.0, dtype=np.float64)
+    for s, kind in enumerate(kinds):
+        out[s] = compute_recal_table(
+            ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
+            kind=kind, F=F, wealth_X=wealth_X, hist_target=hist_target,
+            coarse_n=coarse_n, fine_n=fine_n,
+            ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b, boot_target=boot_target,
+            ret_s=ret_s, stretch_F=stretch_F)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Vectorized simulation (Numba JIT)
 # ---------------------------------------------------------------------------
 
 
 @numba.njit(cache=True, fastmath=True)
+def _realized_vol_60(ret_path, d):
+    """Annualized 60-day realized vol for a path at day d. Uses returns from
+    max(1, d-59)..d (inclusive). Returns 0.0 if fewer than 2 samples."""
+    lo = d - 59
+    if lo < 1:
+        lo = 1
+    n = d - lo + 1
+    if n < 2:
+        return 0.0
+    s = 0.0
+    s2 = 0.0
+    for i in range(lo, d + 1):
+        r = ret_path[i]
+        s += r
+        s2 += r * r
+    mean = s / n
+    var = (s2 - n * mean * mean) / (n - 1)
+    if var <= 0.0:
+        return 0.0
+    return np.sqrt(var * 252.0)
+
+
+@numba.njit(cache=True, fastmath=True)
 def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
-                   avail, F, floor, checkpoint_days, cap_real):
+                   avail, F, floor, checkpoint_days, cap_real, wealth_X,
+                   vol_factor, dip_threshold, dip_bonus,
+                   rate_threshold, rate_factor,
+                   recal_period_days, t_recal_table, e_recal_grid,
+                   h_recal_grid_days,
+                   t_recal_tables_meta, meta_strategy_codes):
     """JIT-compiled per-day, per-path inner loop. Avoids temporary array
-    allocations entirely. kind_code: 0=static, 1=relever, 2=dd_decay.
+    allocations entirely. kind_code: 0=static, 1=relever, 2=dd_decay,
+    3=wealth_decay, 4=hybrid, 5=r_hybrid, 6=vol_hybrid, 7=dip_hybrid,
+    8=rate_hybrid.
 
     `checkpoint_days` (sorted int64 array): the day-indices at which to
     capture the path's instantaneous leverage. Output `lev_at_cp[k, c]` is
@@ -200,6 +389,10 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
     loan = np.full(K, C * (T_init - 1.0))
     hwm_eq = np.full(K, float(C))
     max_dd = np.zeros(K)
+    max_w_prog = np.zeros(K)   # ratcheted wealth progress (kind=5)
+    cur_tgt = np.full(K, float(T_init))   # adaptive_dd monotonic ratchet
+    T_active = np.full(K, float(T_init))   # per-path T_init (recal kinds 12/13/14)
+    strat_active = np.zeros(K, dtype=np.int64)   # meta_recal: index of selected strategy
     called = np.zeros(K, dtype=np.bool_)
     cap_reached = np.zeros(K, dtype=np.bool_)
     peak_lev = np.full(K, float(T_init))
@@ -210,12 +403,21 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
         real_eq[k, 0] = C
 
     t_switch_days = T_yrs * TD
-    is_levered = T_init > 1.0
+    # recal_* kinds may add loan later via lookup; treat them as always levered
+    is_levered = (T_init > 1.0) or (kind_code >= 11)
     cp_idx = 0   # which checkpoint comes next
 
     for d in range(1, max_days + 1):
         s_real_yr = S if d < t_switch_days else S2
-        do_rebal = (kind_code != 0) and (d % REBAL_DAYS == 0)
+        # recal_* kinds 11-14: rebalance only on recal days
+        # kinds 12/13/14: ALSO rebalance on regular REBAL_DAYS (between recals)
+        is_recal_day = (kind_code >= 11) and (recal_period_days > 0) and (d > 0) and (d % recal_period_days == 0)
+        if kind_code == 11:
+            do_rebal = is_recal_day
+        elif kind_code >= 12:
+            do_rebal = is_recal_day or (d % REBAL_DAYS == 0)
+        else:
+            do_rebal = (kind_code != 0) and (d % REBAL_DAYS == 0)
         is_cp = (cp_idx < n_cp) and (d == checkpoint_days[cp_idx])
 
         for k in range(K):
@@ -272,6 +474,451 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                             max_dd[k] = dd_now
                     cand = T_init - F * max_dd[k]
                     target_lev = floor if cand < floor else cand
+                elif kind_code == 3:   # wealth_decay (current eq, real $)
+                    real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                    if wealth_X > C:
+                        prog = (real_eq_d - C) / (wealth_X - C)
+                        if prog < 0.0:
+                            prog = 0.0
+                        elif prog > 1.0:
+                            prog = 1.0
+                        target_lev = T_init - (T_init - floor) * prog
+                    else:
+                        target_lev = floor
+                elif kind_code == 4:   # hybrid (min of dd_decay & wealth_decay)
+                    if eq > hwm_eq[k]:
+                        hwm_eq[k] = eq
+                    if hwm_eq[k] > 0.0:
+                        dd_now = 1.0 - eq / hwm_eq[k]
+                        if dd_now > max_dd[k]:
+                            max_dd[k] = dd_now
+                    cand_dd = T_init - F * max_dd[k]
+                    if cand_dd < floor:
+                        cand_dd = floor
+                    real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                    if wealth_X > C:
+                        prog = (real_eq_d - C) / (wealth_X - C)
+                        if prog < 0.0:
+                            prog = 0.0
+                        elif prog > 1.0:
+                            prog = 1.0
+                        cand_w = T_init - (T_init - floor) * prog
+                    else:
+                        cand_w = floor
+                    target_lev = cand_dd if cand_dd < cand_w else cand_w
+                elif kind_code == 5:   # r_hybrid (ratcheted wealth progress)
+                    if eq > hwm_eq[k]:
+                        hwm_eq[k] = eq
+                    if hwm_eq[k] > 0.0:
+                        dd_now = 1.0 - eq / hwm_eq[k]
+                        if dd_now > max_dd[k]:
+                            max_dd[k] = dd_now
+                    cand_dd = T_init - F * max_dd[k]
+                    if cand_dd < floor:
+                        cand_dd = floor
+                    real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                    if wealth_X > C:
+                        prog = (real_eq_d - C) / (wealth_X - C)
+                        if prog < 0.0:
+                            prog = 0.0
+                        elif prog > 1.0:
+                            prog = 1.0
+                        if prog > max_w_prog[k]:
+                            max_w_prog[k] = prog
+                        cand_w = T_init - (T_init - floor) * max_w_prog[k]
+                    else:
+                        cand_w = floor
+                    target_lev = cand_dd if cand_dd < cand_w else cand_w
+                elif kind_code == 6:   # vol_hybrid
+                    if eq > hwm_eq[k]:
+                        hwm_eq[k] = eq
+                    if hwm_eq[k] > 0.0:
+                        dd_now = 1.0 - eq / hwm_eq[k]
+                        if dd_now > max_dd[k]:
+                            max_dd[k] = dd_now
+                    cand_dd = T_init - F * max_dd[k]
+                    if cand_dd < floor:
+                        cand_dd = floor
+                    real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                    if wealth_X > C:
+                        prog = (real_eq_d - C) / (wealth_X - C)
+                        if prog < 0.0:
+                            prog = 0.0
+                        elif prog > 1.0:
+                            prog = 1.0
+                        cand_w = T_init - (T_init - floor) * prog
+                    else:
+                        cand_w = floor
+                    base = cand_dd if cand_dd < cand_w else cand_w
+                    vol_ann = _realized_vol_60(ret[k], d)
+                    cand = base - vol_factor * vol_ann
+                    target_lev = floor if cand < floor else cand
+                elif kind_code == 7:   # dip_hybrid
+                    if eq > hwm_eq[k]:
+                        hwm_eq[k] = eq
+                    if hwm_eq[k] > 0.0:
+                        dd_now = 1.0 - eq / hwm_eq[k]
+                        if dd_now > max_dd[k]:
+                            max_dd[k] = dd_now
+                    cand_dd = T_init - F * max_dd[k]
+                    if cand_dd < floor:
+                        cand_dd = floor
+                    real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                    if wealth_X > C:
+                        prog = (real_eq_d - C) / (wealth_X - C)
+                        if prog < 0.0:
+                            prog = 0.0
+                        elif prog > 1.0:
+                            prog = 1.0
+                        cand_w = T_init - (T_init - floor) * prog
+                    else:
+                        cand_w = floor
+                    base = cand_dd if cand_dd < cand_w else cand_w
+                    cur_dd = 0.0
+                    if hwm_eq[k] > 0.0:
+                        cur_dd = 1.0 - eq / hwm_eq[k]
+                    if cur_dd > dip_threshold:
+                        dip_floor = T_init + dip_bonus
+                        target_lev = base if base > dip_floor else dip_floor
+                    else:
+                        target_lev = base
+                elif kind_code == 8:   # rate_hybrid
+                    if eq > hwm_eq[k]:
+                        hwm_eq[k] = eq
+                    if hwm_eq[k] > 0.0:
+                        dd_now = 1.0 - eq / hwm_eq[k]
+                        if dd_now > max_dd[k]:
+                            max_dd[k] = dd_now
+                    cand_dd = T_init - F * max_dd[k]
+                    if cand_dd < floor:
+                        cand_dd = floor
+                    real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                    if wealth_X > C:
+                        prog = (real_eq_d - C) / (wealth_X - C)
+                        if prog < 0.0:
+                            prog = 0.0
+                        elif prog > 1.0:
+                            prog = 1.0
+                        cand_w = T_init - (T_init - floor) * prog
+                    else:
+                        cand_w = floor
+                    base = cand_dd if cand_dd < cand_w else cand_w
+                    rate_excess = tsy[k, d] - rate_threshold
+                    if rate_excess < 0.0:
+                        rate_excess = 0.0
+                    cand = base - rate_factor * rate_excess
+                    target_lev = floor if cand < floor else cand
+                elif kind_code == 9:   # adaptive_dd
+                    if eq > hwm_eq[k]:
+                        hwm_eq[k] = eq
+                    if hwm_eq[k] > 0.0:
+                        dd_now = 1.0 - eq / hwm_eq[k]
+                        if dd_now > max_dd[k]:
+                            max_dd[k] = dd_now
+                    if eq > 0.0:
+                        L_now = stocks[k] / eq
+                    else:
+                        L_now = T_init
+                    if T_init > 1.0:
+                        F_eff = F * (L_now - 1.0) / (T_init - 1.0)
+                    else:
+                        F_eff = 0.0
+                    if F_eff < 0.0:
+                        F_eff = 0.0
+                    cand = T_init - F_eff * max_dd[k]
+                    if cand < floor:
+                        cand = floor
+                    if cand < cur_tgt[k]:
+                        cur_tgt[k] = cand
+                    target_lev = cur_tgt[k]
+                elif kind_code == 10:   # adaptive_hybrid (adaptive_dd + wealth)
+                    if eq > hwm_eq[k]:
+                        hwm_eq[k] = eq
+                    if hwm_eq[k] > 0.0:
+                        dd_now = 1.0 - eq / hwm_eq[k]
+                        if dd_now > max_dd[k]:
+                            max_dd[k] = dd_now
+                    if eq > 0.0:
+                        L_now = stocks[k] / eq
+                    else:
+                        L_now = T_init
+                    if T_init > 1.0:
+                        F_eff = F * (L_now - 1.0) / (T_init - 1.0)
+                    else:
+                        F_eff = 0.0
+                    if F_eff < 0.0:
+                        F_eff = 0.0
+                    cand_dd = T_init - F_eff * max_dd[k]
+                    if cand_dd < floor:
+                        cand_dd = floor
+                    if cand_dd < cur_tgt[k]:
+                        cur_tgt[k] = cand_dd
+                    real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                    if wealth_X > C:
+                        prog = (real_eq_d - C) / (wealth_X - C)
+                        if prog < 0.0:
+                            prog = 0.0
+                        elif prog > 1.0:
+                            prog = 1.0
+                        cand_w = T_init - (T_init - floor) * prog
+                    else:
+                        cand_w = floor
+                    target_lev = cur_tgt[k] if cur_tgt[k] < cand_w else cand_w
+                elif kind_code == 11:   # recal_static (lookup-table re-cal)
+                    real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                    h_remaining = max_days - d
+                    n_e = e_recal_grid.shape[0]
+                    n_h = h_recal_grid_days.shape[0]
+                    e_idx = 0
+                    best_de = e_recal_grid[0] - real_eq_d
+                    if best_de < 0.0:
+                        best_de = -best_de
+                    for ee in range(1, n_e):
+                        de_v = e_recal_grid[ee] - real_eq_d
+                        if de_v < 0.0:
+                            de_v = -de_v
+                        if de_v < best_de:
+                            best_de = de_v
+                            e_idx = ee
+                    h_idx = 0
+                    best_dh = h_recal_grid_days[0] - h_remaining
+                    if best_dh < 0:
+                        best_dh = -best_dh
+                    for hh in range(1, n_h):
+                        dh_v = h_recal_grid_days[hh] - h_remaining
+                        if dh_v < 0:
+                            dh_v = -dh_v
+                        if dh_v < best_dh:
+                            best_dh = dh_v
+                            h_idx = hh
+                    target_lev = t_recal_table[e_idx, h_idx]
+                    if target_lev < floor:
+                        target_lev = floor
+                elif kind_code == 12:   # recal_hybrid
+                    if is_recal_day:
+                        # Lookup + state reset + T_active update
+                        real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                        h_remaining = max_days - d
+                        n_e = e_recal_grid.shape[0]
+                        n_h = h_recal_grid_days.shape[0]
+                        e_idx = 0
+                        best_de = e_recal_grid[0] - real_eq_d
+                        if best_de < 0.0:
+                            best_de = -best_de
+                        for ee in range(1, n_e):
+                            de_v = e_recal_grid[ee] - real_eq_d
+                            if de_v < 0.0:
+                                de_v = -de_v
+                            if de_v < best_de:
+                                best_de = de_v
+                                e_idx = ee
+                        h_idx = 0
+                        best_dh = h_recal_grid_days[0] - h_remaining
+                        if best_dh < 0:
+                            best_dh = -best_dh
+                        for hh in range(1, n_h):
+                            dh_v = h_recal_grid_days[hh] - h_remaining
+                            if dh_v < 0:
+                                dh_v = -dh_v
+                            if dh_v < best_dh:
+                                best_dh = dh_v
+                                h_idx = hh
+                        new_T = t_recal_table[e_idx, h_idx]
+                        if new_T < floor:
+                            new_T = floor
+                        T_active[k] = new_T
+                        hwm_eq[k] = eq
+                        max_dd[k] = 0.0
+                        target_lev = new_T
+                    else:
+                        # Regular hybrid logic with T_active[k] as T_init
+                        T_a = T_active[k]
+                        if eq > hwm_eq[k]:
+                            hwm_eq[k] = eq
+                        if hwm_eq[k] > 0.0:
+                            dd_now = 1.0 - eq / hwm_eq[k]
+                            if dd_now > max_dd[k]:
+                                max_dd[k] = dd_now
+                        cand_dd = T_a - F * max_dd[k]
+                        if cand_dd < floor:
+                            cand_dd = floor
+                        real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            cand_w = T_a - (T_a - floor) * prog
+                        else:
+                            cand_w = floor
+                        target_lev = cand_dd if cand_dd < cand_w else cand_w
+                elif kind_code == 13:   # recal_adaptive_dd
+                    if is_recal_day:
+                        real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                        h_remaining = max_days - d
+                        n_e = e_recal_grid.shape[0]
+                        n_h = h_recal_grid_days.shape[0]
+                        e_idx = 0
+                        best_de = e_recal_grid[0] - real_eq_d
+                        if best_de < 0.0:
+                            best_de = -best_de
+                        for ee in range(1, n_e):
+                            de_v = e_recal_grid[ee] - real_eq_d
+                            if de_v < 0.0:
+                                de_v = -de_v
+                            if de_v < best_de:
+                                best_de = de_v
+                                e_idx = ee
+                        h_idx = 0
+                        best_dh = h_recal_grid_days[0] - h_remaining
+                        if best_dh < 0:
+                            best_dh = -best_dh
+                        for hh in range(1, n_h):
+                            dh_v = h_recal_grid_days[hh] - h_remaining
+                            if dh_v < 0:
+                                dh_v = -dh_v
+                            if dh_v < best_dh:
+                                best_dh = dh_v
+                                h_idx = hh
+                        new_T = t_recal_table[e_idx, h_idx]
+                        if new_T < floor:
+                            new_T = floor
+                        T_active[k] = new_T
+                        hwm_eq[k] = eq
+                        max_dd[k] = 0.0
+                        cur_tgt[k] = new_T
+                        target_lev = new_T
+                    else:
+                        T_a = T_active[k]
+                        if eq > hwm_eq[k]:
+                            hwm_eq[k] = eq
+                        if hwm_eq[k] > 0.0:
+                            dd_now = 1.0 - eq / hwm_eq[k]
+                            if dd_now > max_dd[k]:
+                                max_dd[k] = dd_now
+                        if eq > 0.0:
+                            L_now = stocks[k] / eq
+                        else:
+                            L_now = T_a
+                        if T_a > 1.0:
+                            F_eff = F * (L_now - 1.0) / (T_a - 1.0)
+                        else:
+                            F_eff = 0.0
+                        if F_eff < 0.0:
+                            F_eff = 0.0
+                        cand = T_a - F_eff * max_dd[k]
+                        if cand < floor:
+                            cand = floor
+                        if cand < cur_tgt[k]:
+                            cur_tgt[k] = cand
+                        target_lev = cur_tgt[k]
+                elif kind_code == 14:   # meta_recal: pick max-T strategy among candidates
+                    if is_recal_day:
+                        real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                        h_remaining = max_days - d
+                        n_e = e_recal_grid.shape[0]
+                        n_h = h_recal_grid_days.shape[0]
+                        e_idx = 0
+                        best_de = e_recal_grid[0] - real_eq_d
+                        if best_de < 0.0:
+                            best_de = -best_de
+                        for ee in range(1, n_e):
+                            de_v = e_recal_grid[ee] - real_eq_d
+                            if de_v < 0.0:
+                                de_v = -de_v
+                            if de_v < best_de:
+                                best_de = de_v
+                                e_idx = ee
+                        h_idx = 0
+                        best_dh = h_recal_grid_days[0] - h_remaining
+                        if best_dh < 0:
+                            best_dh = -best_dh
+                        for hh in range(1, n_h):
+                            dh_v = h_recal_grid_days[hh] - h_remaining
+                            if dh_v < 0:
+                                dh_v = -dh_v
+                            if dh_v < best_dh:
+                                best_dh = dh_v
+                                h_idx = hh
+                        # Pick strategy with highest T_max for this cell
+                        n_meta = t_recal_tables_meta.shape[0]
+                        best_s = 0
+                        best_T = t_recal_tables_meta[0, e_idx, h_idx]
+                        for ss in range(1, n_meta):
+                            t_s = t_recal_tables_meta[ss, e_idx, h_idx]
+                            if t_s > best_T:
+                                best_T = t_s
+                                best_s = ss
+                        if best_T < floor:
+                            best_T = floor
+                        T_active[k] = best_T
+                        strat_active[k] = best_s
+                        hwm_eq[k] = eq
+                        max_dd[k] = 0.0
+                        cur_tgt[k] = best_T
+                        target_lev = best_T
+                    else:
+                        # Apply active strategy's logic with T_active[k]
+                        s_code = meta_strategy_codes[strat_active[k]]
+                        T_a = T_active[k]
+                        if s_code == 0:   # static between recals: no rebalance
+                            target_lev = stocks[k] / eq if eq > 0.0 else T_a
+                        elif s_code == 2:   # dd_decay
+                            if eq > hwm_eq[k]:
+                                hwm_eq[k] = eq
+                            if hwm_eq[k] > 0.0:
+                                dd_now = 1.0 - eq / hwm_eq[k]
+                                if dd_now > max_dd[k]:
+                                    max_dd[k] = dd_now
+                            cand = T_a - F * max_dd[k]
+                            target_lev = floor if cand < floor else cand
+                        elif s_code == 9:   # adaptive_dd
+                            if eq > hwm_eq[k]:
+                                hwm_eq[k] = eq
+                            if hwm_eq[k] > 0.0:
+                                dd_now = 1.0 - eq / hwm_eq[k]
+                                if dd_now > max_dd[k]:
+                                    max_dd[k] = dd_now
+                            if eq > 0.0:
+                                L_now = stocks[k] / eq
+                            else:
+                                L_now = T_a
+                            if T_a > 1.0:
+                                F_eff = F * (L_now - 1.0) / (T_a - 1.0)
+                            else:
+                                F_eff = 0.0
+                            if F_eff < 0.0:
+                                F_eff = 0.0
+                            cand = T_a - F_eff * max_dd[k]
+                            if cand < floor:
+                                cand = floor
+                            if cand < cur_tgt[k]:
+                                cur_tgt[k] = cand
+                            target_lev = cur_tgt[k]
+                        elif s_code == 4:   # hybrid
+                            if eq > hwm_eq[k]:
+                                hwm_eq[k] = eq
+                            if hwm_eq[k] > 0.0:
+                                dd_now = 1.0 - eq / hwm_eq[k]
+                                if dd_now > max_dd[k]:
+                                    max_dd[k] = dd_now
+                            cand_dd = T_a - F * max_dd[k]
+                            if cand_dd < floor:
+                                cand_dd = floor
+                            real_eq_d = eq * cpi[k, 0] / cpi[k, d]
+                            if wealth_X > C:
+                                prog = (real_eq_d - C) / (wealth_X - C)
+                                if prog < 0.0:
+                                    prog = 0.0
+                                elif prog > 1.0:
+                                    prog = 1.0
+                                cand_w = T_a - (T_a - floor) * prog
+                            else:
+                                cand_w = floor
+                            target_lev = cand_dd if cand_dd < cand_w else cand_w
+                        else:
+                            target_lev = T_a
                 else:
                     target_lev = T_init
                 delta = target_lev * eq - stocks[k]
@@ -292,12 +939,22 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
     return real_eq, called, peak_lev, lev_at_cp
 
 
-_KIND_CODES = {"static": 0, "relever": 1, "dd_decay": 2}
+_KIND_CODES = {"static": 0, "relever": 1, "dd_decay": 2,
+               "wealth_decay": 3, "hybrid": 4,
+               "r_hybrid": 5, "vol_hybrid": 6, "dip_hybrid": 7,
+               "rate_hybrid": 8, "adaptive_dd": 9, "adaptive_hybrid": 10,
+               "recal_static": 11, "recal_hybrid": 12,
+               "recal_adaptive_dd": 13, "meta_recal": 14}
 
 
 def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
              avail=None, F=1.5, floor=1.0, checkpoint_days=None,
-             cap_real=float("inf")):
+             cap_real=float("inf"), wealth_X=float("inf"),
+             vol_factor=0.0, dip_threshold=0.0, dip_bonus=0.0,
+             rate_threshold=float("inf"), rate_factor=0.0,
+             recal_period_days=0, t_recal_table=None,
+             e_recal_grid=None, h_recal_grid_days=None,
+             t_recal_tables_meta=None, meta_strategy_codes=None):
     """Wrapper around the JIT inner loop. Coerces `kind` string to int and
     sets defaults. Returns (real_eq, called, peak_lev, lev_at_cp).
 
@@ -311,6 +968,10 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
 
     `cap_real` (default inf): real-dollar wealth threshold beyond which the
     strategy stops levering up (latches once crossed). Inf disables the cap.
+
+    `wealth_X` (default inf): real-dollar wealth target where wealth_decay /
+    hybrid kinds reach `floor`. Linear interpolation between C and wealth_X.
+    Ignored for kinds other than wealth_decay (3) and hybrid (4).
     """
     K = ret.shape[0]
     if avail is None:
@@ -321,16 +982,56 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
         checkpoint_days = np.zeros(0, dtype=np.int64)
     elif checkpoint_days.dtype != np.int64:
         checkpoint_days = checkpoint_days.astype(np.int64)
+    if t_recal_table is None:
+        t_recal_table = np.zeros((1, 1), dtype=np.float64)
+    elif t_recal_table.dtype != np.float64:
+        t_recal_table = t_recal_table.astype(np.float64)
+    if e_recal_grid is None:
+        e_recal_grid = np.zeros(1, dtype=np.float64)
+    elif e_recal_grid.dtype != np.float64:
+        e_recal_grid = e_recal_grid.astype(np.float64)
+    if h_recal_grid_days is None:
+        h_recal_grid_days = np.zeros(1, dtype=np.int64)
+    elif h_recal_grid_days.dtype != np.int64:
+        h_recal_grid_days = h_recal_grid_days.astype(np.int64)
+    if t_recal_tables_meta is None:
+        t_recal_tables_meta = np.zeros((1, 1, 1), dtype=np.float64)
+    elif t_recal_tables_meta.dtype != np.float64:
+        t_recal_tables_meta = t_recal_tables_meta.astype(np.float64)
+    if meta_strategy_codes is None:
+        meta_strategy_codes = np.zeros(1, dtype=np.int64)
+    elif meta_strategy_codes.dtype != np.int64:
+        meta_strategy_codes = meta_strategy_codes.astype(np.int64)
     return _simulate_core(ret, tsy, cpi, _KIND_CODES[kind], float(T_init),
                           float(C), float(S), float(T_yrs), float(S2),
                           int(max_days), avail, float(F), float(floor),
-                          checkpoint_days, float(cap_real))
+                          checkpoint_days, float(cap_real), float(wealth_X),
+                          float(vol_factor), float(dip_threshold),
+                          float(dip_bonus), float(rate_threshold),
+                          float(rate_factor),
+                          int(recal_period_days), t_recal_table,
+                          e_recal_grid, h_recal_grid_days,
+                          t_recal_tables_meta, meta_strategy_codes)
 
 
 def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
-              avail=None, F=1.5, cap_real=float("inf")):
+              avail=None, F=1.5, cap_real=float("inf"), wealth_X=float("inf"),
+              vol_factor=0.0, dip_threshold=0.0, dip_bonus=0.0,
+              rate_threshold=float("inf"), rate_factor=0.0,
+              recal_period_days=0, t_recal_table=None,
+              e_recal_grid=None, h_recal_grid_days=None,
+              t_recal_tables_meta=None, meta_strategy_codes=None):
     _, called, _, _ = simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
-                            avail=avail, F=F, cap_real=cap_real)
+                            avail=avail, F=F, cap_real=cap_real, wealth_X=wealth_X,
+                            vol_factor=vol_factor, dip_threshold=dip_threshold,
+                            dip_bonus=dip_bonus, rate_threshold=rate_threshold,
+                            rate_factor=rate_factor,
+                            recal_period_days=recal_period_days,
+                            t_recal_table=t_recal_table,
+                            e_recal_grid=e_recal_grid,
+                            h_recal_grid_days=h_recal_grid_days,
+                            t_recal_tables_meta=t_recal_tables_meta,
+                            meta_strategy_codes=meta_strategy_codes)
     return float(called.mean())
 
 
@@ -340,7 +1041,12 @@ def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
 
 @numba.njit(cache=True, fastmath=True)
 def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
-                        max_days, avail, F, floor, cap_real):
+                        max_days, avail, F, floor, cap_real, wealth_X,
+                        vol_factor, dip_threshold, dip_bonus,
+                        rate_threshold, rate_factor,
+                        recal_period_days, t_recal_table, e_recal_grid,
+                        h_recal_grid_days,
+                        t_recal_tables_meta, meta_strategy_codes):
     """Vectorized over T. Runs all T_inits values simultaneously, sharing the
     same per-path data. Returns `called[K, T_count]` only — skips real_eq,
     peak_lev, and leverage tracking since binary search only needs call counts.
@@ -354,6 +1060,10 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
     loan = np.empty((K, T_count))
     hwm_eq = np.full((K, T_count), float(C))
     max_dd = np.zeros((K, T_count))
+    max_w_prog = np.zeros((K, T_count))
+    cur_tgt = np.empty((K, T_count))
+    T_active = np.empty((K, T_count))
+    strat_active = np.zeros((K, T_count), dtype=np.int64)
     called = np.zeros((K, T_count), dtype=np.bool_)
     cap_reached = np.zeros((K, T_count), dtype=np.bool_)
 
@@ -362,12 +1072,20 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
             T_init = T_inits[t]
             stocks[k, t] = C * T_init
             loan[k, t] = C * (T_init - 1.0)
+            cur_tgt[k, t] = T_init
+            T_active[k, t] = T_init
 
     t_switch_days = T_yrs * TD
 
     for d in range(1, max_days + 1):
         s_real_yr = S if d < t_switch_days else S2
-        do_rebal = (kind_code != 0) and (d % REBAL_DAYS == 0)
+        is_recal_day = (kind_code >= 11) and (recal_period_days > 0) and (d > 0) and (d % recal_period_days == 0)
+        if kind_code == 11:
+            do_rebal = is_recal_day
+        elif kind_code >= 12:
+            do_rebal = is_recal_day or (d % REBAL_DAYS == 0)
+        else:
+            do_rebal = (kind_code != 0) and (d % REBAL_DAYS == 0)
 
         for k in range(K):
             if d > avail[k]:
@@ -384,7 +1102,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                     continue
 
                 T_init = T_inits[t]
-                is_levered = T_init > 1.0
+                is_levered = (T_init > 1.0) or (kind_code >= 11)
 
                 stocks_new = stocks[k, t] * (1.0 + ret_d)
                 if is_levered:
@@ -425,6 +1143,447 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                                 max_dd[k, t] = dd_now
                         cand = T_init - F * max_dd[k, t]
                         target_lev = floor if cand < floor else cand
+                    elif kind_code == 3:   # wealth_decay (current eq, real $)
+                        real_eq_d = eq * cpi_0 / cpi_d
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            target_lev = T_init - (T_init - floor) * prog
+                        else:
+                            target_lev = floor
+                    elif kind_code == 4:   # hybrid (min of dd_decay & wealth_decay)
+                        if eq > hwm_eq[k, t]:
+                            hwm_eq[k, t] = eq
+                        if hwm_eq[k, t] > 0.0:
+                            dd_now = 1.0 - eq / hwm_eq[k, t]
+                            if dd_now > max_dd[k, t]:
+                                max_dd[k, t] = dd_now
+                        cand_dd = T_init - F * max_dd[k, t]
+                        if cand_dd < floor:
+                            cand_dd = floor
+                        real_eq_d = eq * cpi_0 / cpi_d
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            cand_w = T_init - (T_init - floor) * prog
+                        else:
+                            cand_w = floor
+                        target_lev = cand_dd if cand_dd < cand_w else cand_w
+                    elif kind_code == 5:   # r_hybrid (ratcheted wealth)
+                        if eq > hwm_eq[k, t]:
+                            hwm_eq[k, t] = eq
+                        if hwm_eq[k, t] > 0.0:
+                            dd_now = 1.0 - eq / hwm_eq[k, t]
+                            if dd_now > max_dd[k, t]:
+                                max_dd[k, t] = dd_now
+                        cand_dd = T_init - F * max_dd[k, t]
+                        if cand_dd < floor:
+                            cand_dd = floor
+                        real_eq_d = eq * cpi_0 / cpi_d
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            if prog > max_w_prog[k, t]:
+                                max_w_prog[k, t] = prog
+                            cand_w = T_init - (T_init - floor) * max_w_prog[k, t]
+                        else:
+                            cand_w = floor
+                        target_lev = cand_dd if cand_dd < cand_w else cand_w
+                    elif kind_code == 6:   # vol_hybrid
+                        if eq > hwm_eq[k, t]:
+                            hwm_eq[k, t] = eq
+                        if hwm_eq[k, t] > 0.0:
+                            dd_now = 1.0 - eq / hwm_eq[k, t]
+                            if dd_now > max_dd[k, t]:
+                                max_dd[k, t] = dd_now
+                        cand_dd = T_init - F * max_dd[k, t]
+                        if cand_dd < floor:
+                            cand_dd = floor
+                        real_eq_d = eq * cpi_0 / cpi_d
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            cand_w = T_init - (T_init - floor) * prog
+                        else:
+                            cand_w = floor
+                        base = cand_dd if cand_dd < cand_w else cand_w
+                        vol_ann = _realized_vol_60(ret[k], d)
+                        cand = base - vol_factor * vol_ann
+                        target_lev = floor if cand < floor else cand
+                    elif kind_code == 7:   # dip_hybrid
+                        if eq > hwm_eq[k, t]:
+                            hwm_eq[k, t] = eq
+                        if hwm_eq[k, t] > 0.0:
+                            dd_now = 1.0 - eq / hwm_eq[k, t]
+                            if dd_now > max_dd[k, t]:
+                                max_dd[k, t] = dd_now
+                        cand_dd = T_init - F * max_dd[k, t]
+                        if cand_dd < floor:
+                            cand_dd = floor
+                        real_eq_d = eq * cpi_0 / cpi_d
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            cand_w = T_init - (T_init - floor) * prog
+                        else:
+                            cand_w = floor
+                        base = cand_dd if cand_dd < cand_w else cand_w
+                        cur_dd = 0.0
+                        if hwm_eq[k, t] > 0.0:
+                            cur_dd = 1.0 - eq / hwm_eq[k, t]
+                        if cur_dd > dip_threshold:
+                            dip_floor = T_init + dip_bonus
+                            target_lev = base if base > dip_floor else dip_floor
+                        else:
+                            target_lev = base
+                    elif kind_code == 8:   # rate_hybrid
+                        if eq > hwm_eq[k, t]:
+                            hwm_eq[k, t] = eq
+                        if hwm_eq[k, t] > 0.0:
+                            dd_now = 1.0 - eq / hwm_eq[k, t]
+                            if dd_now > max_dd[k, t]:
+                                max_dd[k, t] = dd_now
+                        cand_dd = T_init - F * max_dd[k, t]
+                        if cand_dd < floor:
+                            cand_dd = floor
+                        real_eq_d = eq * cpi_0 / cpi_d
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            cand_w = T_init - (T_init - floor) * prog
+                        else:
+                            cand_w = floor
+                        base = cand_dd if cand_dd < cand_w else cand_w
+                        rate_excess = tsy_d - rate_threshold
+                        if rate_excess < 0.0:
+                            rate_excess = 0.0
+                        cand = base - rate_factor * rate_excess
+                        target_lev = floor if cand < floor else cand
+                    elif kind_code == 9:   # adaptive_dd
+                        if eq > hwm_eq[k, t]:
+                            hwm_eq[k, t] = eq
+                        if hwm_eq[k, t] > 0.0:
+                            dd_now = 1.0 - eq / hwm_eq[k, t]
+                            if dd_now > max_dd[k, t]:
+                                max_dd[k, t] = dd_now
+                        if eq > 0.0:
+                            L_now = stocks[k, t] / eq
+                        else:
+                            L_now = T_init
+                        if T_init > 1.0:
+                            F_eff = F * (L_now - 1.0) / (T_init - 1.0)
+                        else:
+                            F_eff = 0.0
+                        if F_eff < 0.0:
+                            F_eff = 0.0
+                        cand = T_init - F_eff * max_dd[k, t]
+                        if cand < floor:
+                            cand = floor
+                        if cand < cur_tgt[k, t]:
+                            cur_tgt[k, t] = cand
+                        target_lev = cur_tgt[k, t]
+                    elif kind_code == 10:   # adaptive_hybrid
+                        if eq > hwm_eq[k, t]:
+                            hwm_eq[k, t] = eq
+                        if hwm_eq[k, t] > 0.0:
+                            dd_now = 1.0 - eq / hwm_eq[k, t]
+                            if dd_now > max_dd[k, t]:
+                                max_dd[k, t] = dd_now
+                        if eq > 0.0:
+                            L_now = stocks[k, t] / eq
+                        else:
+                            L_now = T_init
+                        if T_init > 1.0:
+                            F_eff = F * (L_now - 1.0) / (T_init - 1.0)
+                        else:
+                            F_eff = 0.0
+                        if F_eff < 0.0:
+                            F_eff = 0.0
+                        cand_dd = T_init - F_eff * max_dd[k, t]
+                        if cand_dd < floor:
+                            cand_dd = floor
+                        if cand_dd < cur_tgt[k, t]:
+                            cur_tgt[k, t] = cand_dd
+                        real_eq_d = eq * cpi_0 / cpi_d
+                        if wealth_X > C:
+                            prog = (real_eq_d - C) / (wealth_X - C)
+                            if prog < 0.0:
+                                prog = 0.0
+                            elif prog > 1.0:
+                                prog = 1.0
+                            cand_w = T_init - (T_init - floor) * prog
+                        else:
+                            cand_w = floor
+                        target_lev = cur_tgt[k, t] if cur_tgt[k, t] < cand_w else cand_w
+                    elif kind_code == 11:   # recal_static
+                        real_eq_d = eq * cpi_0 / cpi_d
+                        h_remaining = max_days - d
+                        n_e = e_recal_grid.shape[0]
+                        n_h = h_recal_grid_days.shape[0]
+                        e_idx = 0
+                        best_de = e_recal_grid[0] - real_eq_d
+                        if best_de < 0.0:
+                            best_de = -best_de
+                        for ee in range(1, n_e):
+                            de_v = e_recal_grid[ee] - real_eq_d
+                            if de_v < 0.0:
+                                de_v = -de_v
+                            if de_v < best_de:
+                                best_de = de_v
+                                e_idx = ee
+                        h_idx = 0
+                        best_dh = h_recal_grid_days[0] - h_remaining
+                        if best_dh < 0:
+                            best_dh = -best_dh
+                        for hh in range(1, n_h):
+                            dh_v = h_recal_grid_days[hh] - h_remaining
+                            if dh_v < 0:
+                                dh_v = -dh_v
+                            if dh_v < best_dh:
+                                best_dh = dh_v
+                                h_idx = hh
+                        target_lev = t_recal_table[e_idx, h_idx]
+                        if target_lev < floor:
+                            target_lev = floor
+                    elif kind_code == 12:   # recal_hybrid (grid)
+                        if is_recal_day:
+                            real_eq_d = eq * cpi_0 / cpi_d
+                            h_remaining = max_days - d
+                            n_e = e_recal_grid.shape[0]
+                            n_h = h_recal_grid_days.shape[0]
+                            e_idx = 0
+                            best_de = e_recal_grid[0] - real_eq_d
+                            if best_de < 0.0:
+                                best_de = -best_de
+                            for ee in range(1, n_e):
+                                de_v = e_recal_grid[ee] - real_eq_d
+                                if de_v < 0.0:
+                                    de_v = -de_v
+                                if de_v < best_de:
+                                    best_de = de_v
+                                    e_idx = ee
+                            h_idx = 0
+                            best_dh = h_recal_grid_days[0] - h_remaining
+                            if best_dh < 0:
+                                best_dh = -best_dh
+                            for hh in range(1, n_h):
+                                dh_v = h_recal_grid_days[hh] - h_remaining
+                                if dh_v < 0:
+                                    dh_v = -dh_v
+                                if dh_v < best_dh:
+                                    best_dh = dh_v
+                                    h_idx = hh
+                            new_T = t_recal_table[e_idx, h_idx]
+                            if new_T < floor:
+                                new_T = floor
+                            T_active[k, t] = new_T
+                            hwm_eq[k, t] = eq
+                            max_dd[k, t] = 0.0
+                            target_lev = new_T
+                        else:
+                            T_a = T_active[k, t]
+                            if eq > hwm_eq[k, t]:
+                                hwm_eq[k, t] = eq
+                            if hwm_eq[k, t] > 0.0:
+                                dd_now = 1.0 - eq / hwm_eq[k, t]
+                                if dd_now > max_dd[k, t]:
+                                    max_dd[k, t] = dd_now
+                            cand_dd = T_a - F * max_dd[k, t]
+                            if cand_dd < floor:
+                                cand_dd = floor
+                            real_eq_d = eq * cpi_0 / cpi_d
+                            if wealth_X > C:
+                                prog = (real_eq_d - C) / (wealth_X - C)
+                                if prog < 0.0:
+                                    prog = 0.0
+                                elif prog > 1.0:
+                                    prog = 1.0
+                                cand_w = T_a - (T_a - floor) * prog
+                            else:
+                                cand_w = floor
+                            target_lev = cand_dd if cand_dd < cand_w else cand_w
+                    elif kind_code == 13:   # recal_adaptive_dd (grid)
+                        if is_recal_day:
+                            real_eq_d = eq * cpi_0 / cpi_d
+                            h_remaining = max_days - d
+                            n_e = e_recal_grid.shape[0]
+                            n_h = h_recal_grid_days.shape[0]
+                            e_idx = 0
+                            best_de = e_recal_grid[0] - real_eq_d
+                            if best_de < 0.0:
+                                best_de = -best_de
+                            for ee in range(1, n_e):
+                                de_v = e_recal_grid[ee] - real_eq_d
+                                if de_v < 0.0:
+                                    de_v = -de_v
+                                if de_v < best_de:
+                                    best_de = de_v
+                                    e_idx = ee
+                            h_idx = 0
+                            best_dh = h_recal_grid_days[0] - h_remaining
+                            if best_dh < 0:
+                                best_dh = -best_dh
+                            for hh in range(1, n_h):
+                                dh_v = h_recal_grid_days[hh] - h_remaining
+                                if dh_v < 0:
+                                    dh_v = -dh_v
+                                if dh_v < best_dh:
+                                    best_dh = dh_v
+                                    h_idx = hh
+                            new_T = t_recal_table[e_idx, h_idx]
+                            if new_T < floor:
+                                new_T = floor
+                            T_active[k, t] = new_T
+                            hwm_eq[k, t] = eq
+                            max_dd[k, t] = 0.0
+                            cur_tgt[k, t] = new_T
+                            target_lev = new_T
+                        else:
+                            T_a = T_active[k, t]
+                            if eq > hwm_eq[k, t]:
+                                hwm_eq[k, t] = eq
+                            if hwm_eq[k, t] > 0.0:
+                                dd_now = 1.0 - eq / hwm_eq[k, t]
+                                if dd_now > max_dd[k, t]:
+                                    max_dd[k, t] = dd_now
+                            if eq > 0.0:
+                                L_now = stocks[k, t] / eq
+                            else:
+                                L_now = T_a
+                            if T_a > 1.0:
+                                F_eff = F * (L_now - 1.0) / (T_a - 1.0)
+                            else:
+                                F_eff = 0.0
+                            if F_eff < 0.0:
+                                F_eff = 0.0
+                            cand = T_a - F_eff * max_dd[k, t]
+                            if cand < floor:
+                                cand = floor
+                            if cand < cur_tgt[k, t]:
+                                cur_tgt[k, t] = cand
+                            target_lev = cur_tgt[k, t]
+                    elif kind_code == 14:   # meta_recal (grid)
+                        if is_recal_day:
+                            real_eq_d = eq * cpi_0 / cpi_d
+                            h_remaining = max_days - d
+                            n_e = e_recal_grid.shape[0]
+                            n_h = h_recal_grid_days.shape[0]
+                            e_idx = 0
+                            best_de = e_recal_grid[0] - real_eq_d
+                            if best_de < 0.0:
+                                best_de = -best_de
+                            for ee in range(1, n_e):
+                                de_v = e_recal_grid[ee] - real_eq_d
+                                if de_v < 0.0:
+                                    de_v = -de_v
+                                if de_v < best_de:
+                                    best_de = de_v
+                                    e_idx = ee
+                            h_idx = 0
+                            best_dh = h_recal_grid_days[0] - h_remaining
+                            if best_dh < 0:
+                                best_dh = -best_dh
+                            for hh in range(1, n_h):
+                                dh_v = h_recal_grid_days[hh] - h_remaining
+                                if dh_v < 0:
+                                    dh_v = -dh_v
+                                if dh_v < best_dh:
+                                    best_dh = dh_v
+                                    h_idx = hh
+                            n_meta = t_recal_tables_meta.shape[0]
+                            best_s = 0
+                            best_T = t_recal_tables_meta[0, e_idx, h_idx]
+                            for ss in range(1, n_meta):
+                                t_s = t_recal_tables_meta[ss, e_idx, h_idx]
+                                if t_s > best_T:
+                                    best_T = t_s
+                                    best_s = ss
+                            if best_T < floor:
+                                best_T = floor
+                            T_active[k, t] = best_T
+                            strat_active[k, t] = best_s
+                            hwm_eq[k, t] = eq
+                            max_dd[k, t] = 0.0
+                            cur_tgt[k, t] = best_T
+                            target_lev = best_T
+                        else:
+                            s_code = meta_strategy_codes[strat_active[k, t]]
+                            T_a = T_active[k, t]
+                            if s_code == 0:
+                                target_lev = stocks[k, t] / eq if eq > 0.0 else T_a
+                            elif s_code == 2:
+                                if eq > hwm_eq[k, t]:
+                                    hwm_eq[k, t] = eq
+                                if hwm_eq[k, t] > 0.0:
+                                    dd_now = 1.0 - eq / hwm_eq[k, t]
+                                    if dd_now > max_dd[k, t]:
+                                        max_dd[k, t] = dd_now
+                                cand = T_a - F * max_dd[k, t]
+                                target_lev = floor if cand < floor else cand
+                            elif s_code == 9:
+                                if eq > hwm_eq[k, t]:
+                                    hwm_eq[k, t] = eq
+                                if hwm_eq[k, t] > 0.0:
+                                    dd_now = 1.0 - eq / hwm_eq[k, t]
+                                    if dd_now > max_dd[k, t]:
+                                        max_dd[k, t] = dd_now
+                                if eq > 0.0:
+                                    L_now = stocks[k, t] / eq
+                                else:
+                                    L_now = T_a
+                                if T_a > 1.0:
+                                    F_eff = F * (L_now - 1.0) / (T_a - 1.0)
+                                else:
+                                    F_eff = 0.0
+                                if F_eff < 0.0:
+                                    F_eff = 0.0
+                                cand = T_a - F_eff * max_dd[k, t]
+                                if cand < floor:
+                                    cand = floor
+                                if cand < cur_tgt[k, t]:
+                                    cur_tgt[k, t] = cand
+                                target_lev = cur_tgt[k, t]
+                            elif s_code == 4:
+                                if eq > hwm_eq[k, t]:
+                                    hwm_eq[k, t] = eq
+                                if hwm_eq[k, t] > 0.0:
+                                    dd_now = 1.0 - eq / hwm_eq[k, t]
+                                    if dd_now > max_dd[k, t]:
+                                        max_dd[k, t] = dd_now
+                                cand_dd = T_a - F * max_dd[k, t]
+                                if cand_dd < floor:
+                                    cand_dd = floor
+                                real_eq_d = eq * cpi_0 / cpi_d
+                                if wealth_X > C:
+                                    prog = (real_eq_d - C) / (wealth_X - C)
+                                    if prog < 0.0:
+                                        prog = 0.0
+                                    elif prog > 1.0:
+                                        prog = 1.0
+                                    cand_w = T_a - (T_a - floor) * prog
+                                else:
+                                    cand_w = floor
+                                target_lev = cand_dd if cand_dd < cand_w else cand_w
+                            else:
+                                target_lev = T_a
                     else:
                         target_lev = T_init
                     delta = target_lev * eq - stocks[k, t]
@@ -438,7 +1597,12 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
 def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
                           avail=None, F=1.5, floor=1.0,
                           lo=1.0, hi=3.0, coarse_n=12, fine_n=12,
-                          cap_real=float("inf")):
+                          cap_real=float("inf"), wealth_X=float("inf"),
+                          vol_factor=0.0, dip_threshold=0.0, dip_bonus=0.0,
+                          rate_threshold=float("inf"), rate_factor=0.0,
+                          recal_period_days=0, t_recal_table=None,
+                          e_recal_grid=None, h_recal_grid_days=None,
+                          t_recal_tables_meta=None, meta_strategy_codes=None):
     """Two-pass grid search for largest T_init with call rate ≤ target.
 
     Pass 1: coarse linear grid over [lo, hi] with coarse_n points.
@@ -453,11 +1617,38 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
         avail = avail.astype(np.int64)
     kind_code = _KIND_CODES[kind]
 
+    if t_recal_table is None:
+        t_recal_table = np.zeros((1, 1), dtype=np.float64)
+    elif t_recal_table.dtype != np.float64:
+        t_recal_table = t_recal_table.astype(np.float64)
+    if e_recal_grid is None:
+        e_recal_grid = np.zeros(1, dtype=np.float64)
+    elif e_recal_grid.dtype != np.float64:
+        e_recal_grid = e_recal_grid.astype(np.float64)
+    if h_recal_grid_days is None:
+        h_recal_grid_days = np.zeros(1, dtype=np.int64)
+    elif h_recal_grid_days.dtype != np.int64:
+        h_recal_grid_days = h_recal_grid_days.astype(np.int64)
+    if t_recal_tables_meta is None:
+        t_recal_tables_meta = np.zeros((1, 1, 1), dtype=np.float64)
+    elif t_recal_tables_meta.dtype != np.float64:
+        t_recal_tables_meta = t_recal_tables_meta.astype(np.float64)
+    if meta_strategy_codes is None:
+        meta_strategy_codes = np.zeros(1, dtype=np.int64)
+    elif meta_strategy_codes.dtype != np.int64:
+        meta_strategy_codes = meta_strategy_codes.astype(np.int64)
+
     def _eval(T_grid):
         called = _simulate_core_grid(ret, tsy, cpi, kind_code, T_grid,
                                      float(C), float(S), float(T_yrs), float(S2),
                                      int(max_days), avail, float(F), float(floor),
-                                     float(cap_real))
+                                     float(cap_real), float(wealth_X),
+                                     float(vol_factor), float(dip_threshold),
+                                     float(dip_bonus), float(rate_threshold),
+                                     float(rate_factor),
+                                     int(recal_period_days), t_recal_table,
+                                     e_recal_grid, h_recal_grid_days,
+                                     t_recal_tables_meta, meta_strategy_codes)
         return called.mean(axis=0)
 
     coarse = np.linspace(lo, hi, coarse_n)
@@ -481,16 +1672,17 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
 
 
 def find_max_safe_T(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
-                     avail=None, F=1.5, lo=1.0, hi=3.0, n_iters=7):
+                     avail=None, F=1.5, lo=1.0, hi=3.0, n_iters=7,
+                     wealth_X=float("inf")):
     """Binary search for largest T_init with call rate ≤ target."""
     rate_hi = call_rate(ret, tsy, cpi, kind, hi, C, S, T_yrs, S2, max_days,
-                         avail=avail, F=F)
+                         avail=avail, F=F, wealth_X=wealth_X)
     if rate_hi <= target:
         return hi
     for _ in range(n_iters):
         mid = 0.5 * (lo + hi)
         if call_rate(ret, tsy, cpi, kind, mid, C, S, T_yrs, S2, max_days,
-                     avail=avail, F=F) <= target:
+                     avail=avail, F=F, wealth_X=wealth_X) <= target:
             lo = mid
         else:
             hi = mid

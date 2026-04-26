@@ -26,6 +26,8 @@ All scripts are self-contained: they read from `spx_margin_history.csv` (not the
 5b. [Decay strategy deep dive](#5b-decay-strategy-deep-dive-added-in-second-session)
 5c. [End-of-horizon leverage](#5c-end-of-horizon-leverage-added-in-third-session)
 5d. [Generalization vs overfitting](#5d-generalization-vs-overfitting-added-in-third-session)
+5e. [Streamlit app + new strategy families](#5e-streamlit-app--new-strategy-families-added-in-fourth-session)
+5f. [Re-calibration strategies + meta_recal](#5f-re-calibration-strategies--meta_recal-added-in-fifth-session)
 6. [Practical recommendations](#6-practical-recommendations)
 7. [Caveats and limitations](#7-caveats-and-limitations)
 8. [Important corrections made during analysis](#8-important-corrections-made-during-analysis)
@@ -629,6 +631,299 @@ Drawdown-decay F=2.0 well-defended matches wealth-decay's well-defended IRR (12.
 | 6 | Monthly relever | Maximally exposed to path randomness | 13.80% |
 
 **Drawdown-decay should replace wealth-decay and time-decay in the recommendation hierarchy.** The architectural critique was correct AND the practical payoff is real.
+
+---
+
+## 5e. Streamlit app + new strategy families (added in fourth session)
+
+The fourth session built the Streamlit interface (`app.py`) and added a richer
+strategy taxonomy. Most of the strategies that follow operate inside the JIT
+inner loop (`_simulate_core` / `_simulate_core_grid` in
+`project_portfolio.py`) under integer kind codes 0-10. Each is reachable from
+the Streamlit sidebar.
+
+### New core strategies
+
+- **`wealth_decay` (kind 3)** — current-equity wealth glide. Target linearly
+  interpolates from `T_init` (when real equity = `C`) down to `floor` (when
+  real equity = `wealth_X`). NOT a ratchet; symmetric in equity. Pure
+  utility-glide, gameable by DCA. Bootstrap fragility intermediate.
+
+- **`hybrid` (kind 4)** — `min(dd_decay_target, wealth_decay_target)`. Both
+  signals lower target independently; more conservative wins. Pareto-dominates
+  wealth_decay (dd component rescues paths where a deep drawdown hits before
+  equity reaches `wealth_X`). **User-developed.** Default for the Streamlit
+  app's Tier-1 recommendation when the user has an "unlever at $X" goal.
+
+- **`r_hybrid` (kind 5)** — ratcheted hybrid. Wealth-progress also ratchets
+  up (never decreases), so the wealth-decay component becomes monotonic.
+  Removes "rebound and re-lever during drawdown" failure mode. In high-DCA
+  scenarios where wealth grows monotonically anyway, behaves identically to
+  hybrid.
+
+- **`vol_hybrid` (kind 6)** — `hybrid_target − vol_factor × σ_60_annualized`.
+  Couples target to current 60d realized volatility (σ_60 = sqrt(252) ×
+  stdev of daily returns). Vol leads drawdowns by days/weeks, so this fires
+  *before* dd_decay's reactive ratchet. Common hedge-fund "vol targeting"
+  pattern.
+
+- **`dip_hybrid` (kind 7)** — buy-the-dip override. When `cur_dd > dip_threshold`,
+  target is FLOORED at `T_init + dip_bonus` (allowed ABOVE `T_init` during
+  deep drawdowns). **Empirical TRAP**: looks good historically (real history
+  has ~one drawdown per cycle) but blows up on bootstrap (clustered drawdowns
+  stack the bonus on top of accumulated damage). T_rec collapses ~15-30%.
+
+- **`rate_hybrid` (kind 8)** — `hybrid_target − rate_factor × max(0, tsy_3M − rate_threshold)`.
+  Deleverages when carry-trade economics deteriorate. Default τ=5%, ρ=5.
+  Historic high-rate periods are short and rare in post-1932 sample, so
+  haircut rarely fires; behaves ≈ hybrid in practice.
+
+- **`adaptive_dd` (kind 9)** — drawdown-decay with cushion-coupled F:
+  `F_eff = F × (L_now − 1) / (T_init − 1)`. Decay aggressive when leverage
+  is near `T_init` (small cushion), mild when already deleveraged (big
+  cushion). Monotonic-down ratchet on target. Modest Pareto improvement
+  over plain `dd_decay`: bootstrap call rate roughly halved (~3.8% vs ~6%
+  at historical-safe T) with ~15 bps higher p50 IRR.
+
+- **`adaptive_hybrid` (kind 10)** — adaptive_dd + wealth glide. In
+  heavy-DCA scenarios, the wealth glide is the binding constraint
+  (equity crosses `wealth_X` before dd ratchet fires), so behaves
+  identically to plain hybrid. Differentiates from hybrid in low-DCA
+  scenarios.
+
+### Streamlit UI architecture
+
+- **`app.py`** wraps `project_portfolio.py` with sidebar inputs (scenario,
+  strategy checkboxes, safety bars, horizon, display mode) and triggers a
+  cached compute on demand.
+- **Path arrays** (historical + bootstrap) are cached via `@st.cache_resource`.
+  **Calibration + projection** are cached via `@st.cache_data`.
+- **Multi-page setup** (`pages/Documentation.py`) provides a comprehensive
+  reference for end users; covers data, math, strategy catalog, calibration
+  methodology, and caveats.
+
+### Tax assumption changed: `BOX_TAX_BENEFIT = 0.0` (was 0.20)
+
+For a strict hold-forever SPX investor with no other realized capital
+gains, only ~$3,000/yr of Section-1256 60/40 capital losses are usable
+(against ordinary income); the rest accumulates as carryforward with
+uncertain future value. Setting tax benefit to 0 is the honest
+conservative assumption for the hold-forever profile. **Effect:**
+loan grows ~20% faster ⇒ T_rec drops ~0.05x for active strategies
+(2000-09 path is sensitive to long compounding); strategy ranking
+unchanged.
+
+### Defaults adjusted in fourth session
+
+- Stretch factor F default: 1.0 → **1.1** (always defend against 10%-deeper
+  drawdowns)
+- Bootstrap synthetic paths default: 1000 → **500** (faster compute, still
+  enough resolution)
+- Wealth cap toggle default: ON → **OFF** (was confusing the cap-vs-glide
+  distinction)
+- Removed the 4.0x call-threshold horizontal line from leverage chart
+  (compressed the visible range)
+
+---
+
+## 5f. Re-calibration strategies + meta_recal (added in fifth session)
+
+The fifth session added strategies that periodically *re-pick* their target
+leverage based on the path's current state, modeling the natural use of the
+tool: "every N years/months, observe my actual portfolio state and re-decide
+my optimal leverage."
+
+### Concept
+
+A re-calibration strategy:
+1. Pre-computes a 2D lookup table $T^{*}(E_{\text{real}}, H_{\text{remaining}})$
+   over a coarse grid (6 equity × 6 horizon = 36 cells), where each cell
+   value is the well-defended max-safe T for the given starting state +
+   remaining horizon (well-defended = `min(T_hist@0%, T_boot@boot_target,
+   T_stretch@0%-with-stretch-1.1×)` — the same architecture as the rest of
+   the app's calibration).
+2. At each re-cal event (every `recal_period_days`), looks up the closest
+   cell, **resets path-conditional state** (max_dd=0, hwm=current_eq), sets
+   `T_active = lookup_value`, and **takes additional loan to bring leverage
+   to T_active**. Lever-up only — never sells (matches hold-forever
+   constraint, no tax events).
+3. Between re-cal events, applies the base strategy's logic (with `T_active`
+   in place of `T_init`).
+
+### New code
+
+- **`compute_recal_table(...)`** in `project_portfolio.py` — builds the 2D
+  lookup table for a given base strategy (`static`, `dd_decay`,
+  `adaptive_dd`, `hybrid`). Optional bootstrap + stretch paths produce the
+  well-defended T_max per cell.
+- **`compute_recal_tables_multi(..., kinds=[...])`** — wraps the above to
+  produce a 3D table (n_kinds × n_e × n_h) for `meta_recal`'s candidate set.
+- **JIT kind codes 11-14** in `_simulate_core` and `_simulate_core_grid`:
+  - **`recal_static` (11)** — static between recals; recal event lifts to
+    lookup `T_max`.
+  - **`recal_hybrid` (12)** — hybrid between recals; recal resets `max_dd`
+    + `hwm` and lifts `T_active` to lookup.
+  - **`recal_adaptive_dd` (13)** — adaptive_dd between recals; same
+    reset/lift pattern.
+  - **`meta_recal` (14)** — at each recal event, picks the strategy with
+    `argmax(T_max[s, e_idx, h_idx])` over candidate slices. Currently
+    hard-coded to candidate set {static (s_code=0), dd_decay (s_code=2),
+    adaptive_dd (s_code=9), hybrid (s_code=4)}. Between recals, applies
+    the chosen strategy's logic with the chosen `T_active`.
+
+### Per-path state additions
+
+- `T_active[k]` (per path) — current target, updated at recal events
+- `strat_active[k]` (per path, int) — for meta_recal: which candidate
+  slice is currently active
+- `is_levered = (T_init > 1.0) or (kind_code >= 11)` — recal kinds always
+  treated as levered so loan compounding fires even when initial T = 1.0x
+- The is_recal_day check fires for kind ≥ 11 on `d % recal_period_days == 0`
+
+### Streamlit integration
+
+- **Sidebar checkboxes**: `recal_static`, `recal_hybrid`,
+  `recal_adaptive_dd`, `meta_recal`.
+- **Slider**: `recal period (months)`, range 1-180, default 60 (= 5 years).
+  Internally: `recal_period_days = months × 21`.
+- **Pre-compute**: tables are computed inside `compute()` only for the
+  base strategies actually needed by the selected recal strategies (3D
+  meta-table only built if meta_recal is selected). Adds ~5-20s to first
+  run depending on which strategies are toggled.
+- **Stretched paths**: `ret_s_for_recal = stretch_returns(ret_c, stretch_F)`
+  if `stretch_F > 1`, threaded into `compute_recal_table` as `ret_s`.
+- **Per-strategy table dispatch**: `recal_kw_for(name)` returns the right
+  2D table (static-table for `recal_static`, hybrid-table for
+  `recal_hybrid`, adaptive_dd-table for `recal_adaptive_dd`) plus the
+  shared 3D + meta_codes for meta_recal.
+
+### Empirical findings (user's scenario, C=160k S=180k×5y S2=30k X=$3M, 30y)
+
+**Period sweep on `recal_static`** (T_init = 1.0x, no calibration):
+
+| Period | Hist calls | Boot calls | p50@30y |
+|---|---|---|---|
+| 1 month | 27.4% | 33.0% | $21.17M |
+| 3 months | 27.4% | 31.4% | $20.85M |
+| 1 year | 27.1% | 26.2% | $19.50M |
+| 5 years | **14.9%** | **15.0%** | $15.97M |
+| 10 years | 7.5% | 8.6% | $14.11M |
+
+**Monthly recal is catastrophic** (resembles relever-with-adaptive-target).
+**5y is the knee**; 10y is safest but leaves IRR on the table.
+
+**Well-defended lookup** (cell target = boot_target = 1%, stretch 1.1×) at
+5y period, with proper T_init calibration:
+
+| Strategy | T_rec | Hist | Boot | p10 | p50 | p90 |
+|---|---|---|---|---|---|---|
+| static | 2.140x | 0% | 0% | $5.98M | $10.82M | $19.11M |
+| hybrid | 1.661x | 0% | 0.8% | $6.51M | $12.52M | $21.63M |
+| recal_static | **1.000x** | 0% | 3.2% | $6.34M | $13.31M | $27.84M |
+| recal_hybrid | **1.000x** | 0% | 3.0% | $6.34M | $13.31M | $27.60M |
+| recal_adaptive_dd | **1.000x** | 0% | 2.8% | $6.30M | $13.30M | $28.62M |
+| meta_recal | **1.000x** | 0% | 3.2% | $6.34M | $13.31M | $27.84M |
+
+### Critical caveats
+
+1. **T_init calibrates to 1.0x for all recal strategies in this scenario.**
+   The find_max_safe_T_grid binary search returns the lower bound (1.0x)
+   when no T_init in [1.0, 3.0] satisfies ≤1% bootstrap calls. This means
+   **the strategy starts unleveraged for years 0-5 (until first recal
+   event)**, missing the heavy-DCA window where plain static can safely
+   take 2.14x. **This is a real limitation** — the recal strategies
+   under-utilize the early-horizon high-DCA period. Open question (high
+   priority): should there be a separate calibration of the pre-recal-phase
+   T_init?
+
+2. **Cell-level vs strategy-level safety distinction.** Per-cell safety
+   bar = `boot_target` (1% by default). The lookup picks the highest T_max
+   that's safe FROM THIS CELL FORWARD assuming static-from-here behavior.
+   But the actual strategy goes through ~6 recal events over 30y, and call
+   probabilities compound — strategy-level rate ends up ~3% empirically.
+   This is the user-accepted trade-off: each individual decision is honest
+   by the same standard as the rest of the app; the aggregate is what it
+   is. An earlier auto-scaling experiment (cell_target = boot_target /
+   n_recal_events) was reverted as over-conservative; the user's spec is
+   explicit cell-level safety.
+
+3. **All four recal strategies converge in this scenario.** Well-defended
+   T_max values are nearly identical across {static, dd_decay,
+   adaptive_dd, hybrid} in the binding cells (range [1.245, 1.612]).
+   `meta_recal` correctly picks the max but max ≈ static almost
+   everywhere, so it acts like recal_static. Differentiation between
+   recal flavors should appear in low-DCA scenarios with deeper or
+   longer drawdowns — untested.
+
+4. **State reset at each recal is intentional but architecturally
+   debatable.** Resetting `max_dd = 0` and `hwm = current_eq` means each
+   recal event starts the strategy "fresh" — the dd_decay ratchet from
+   prior crises is forgotten. Alternative (Option B from conversation):
+   preserve `max_dd` across recals so the ratchet keeps protecting after
+   prior stress. Predicted to lower bootstrap fragility from ~3% to ~1%
+   while sacrificing some IRR uplift on quiet paths. **Untested**.
+
+5. **Lookup grid is coarse**: 6×6 cells with nearest-neighbor lookup.
+   Equity grid is log-spaced over [0.5×C, 100×C]; horizon grid is
+   [5, 10, 15, 20, 25, 30]. Could be made finer at compute cost.
+   For robust cells, the existing grid is fine; for high-equity edge
+   cases the lookup may be quantized.
+
+### Why recal isn't strictly Pareto-better than plain hybrid
+
+- Plain `hybrid` calibrates `T_init` ≈ 1.66x for the WHOLE 30y trajectory;
+  takes that loan day 0 and runs.
+- `recal_hybrid` calibrates `T_init` ≈ 1.0x (no day-0 loan), then year-5
+  recal levers up to lookup ≈ 1.6x. Loses 5 years of leveraged growth that
+  plain hybrid captures.
+- p50 difference: $13.31M (recal_hybrid) vs $12.52M (hybrid) → recal wins
+  by +6%. p90 difference: $27.6M vs $21.6M → recal wins +28%. Cost: bootstrap
+  call rate 3.0% vs 0.8%.
+
+The trade is: trade tail safety for fatter upside (especially p90). The
+recal strategy maintains leverage near 1.5-1.6x for years 5-30 instead of
+letting it drift to 1.05x like plain static does. Sustained leverage =
+sustained compounding upside on lucky paths.
+
+### Open questions for next session
+
+1. **High priority — fix T_init calibration.** Currently bottoms out at 1.0x.
+   Possible fixes:
+   - Calibrate T_init only for the pre-recal phase (years 0 to first
+     recal_period), NOT the full horizon
+   - Require `find_max_safe_T_grid` to return the lo bound instead of 1.0
+     when no T satisfies target, so we know calibration "failed" and can
+     handle accordingly
+   - For the heavy-DCA scenario specifically, T_init = 2.14x (static's
+     calibrated value) is probably right since years 0-5 are static-mode
+2. **Test on different scenarios**: low-DCA (e.g., C=$1M S=$30k/yr), longer
+   horizon, different `wealth_X`. Should differentiate the recal flavors
+   from each other.
+3. **Option B (preserve dd ratchet across recals)** — empirically test
+   whether keeping `max_dd` permanent across recals reduces bootstrap call
+   rate without sacrificing too much IRR.
+4. **Adaptive recal_period** — longer after observed crashes, shorter
+   during calm. Couples recal frequency to a state variable.
+5. **Joint-defended sizing**: instead of per-cell ≤1%, find the T_init
+   such that the *strategy as a whole* has ≤1% bootstrap calls. Likely
+   produces lower IRR than current approach but matches the rest-of-app
+   convention more cleanly.
+6. **Document recal strategies in `pages/Documentation.py`** — the
+   strategy catalog there does NOT yet include the 4 recal kinds. Worth
+   adding entries in the same format as existing strategies. (Done in
+   this session.)
+7. **Checkpoint capture** currently captures pre-rebalance leverage; for
+   recal days this misses the lift. Consider capturing both, or
+   post-rebalance for recal kinds.
+
+### How to use re-calibration in practice
+
+Less algorithmic, more operational: every 2-3 years (or on major life
+events / wealth milestones / observed drawdowns), re-run the simulator
+with current portfolio state and decide a fresh strategy. The
+`recal_static` / `recal_hybrid` strategies *simulate* this workflow
+algorithmically, but the real workflow is for the user to do it
+manually with up-to-date data.
 
 ---
 

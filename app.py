@@ -27,6 +27,8 @@ from project_portfolio import (
     build_bootstrap_paths,
     build_historical_paths,
     call_rate,
+    compute_recal_table,
+    compute_recal_tables_multi,
     find_max_safe_T_grid,
     percentiles_at,
     simulate,
@@ -63,9 +65,10 @@ hold-forever taxable account. Given your savings pattern and a horizon, it:
 
 Sources: SPX-TR daily 1927-2026 (Bloomberg + yfinance), 3M Treasury (FRED
 DGS3MO), CPI-U (FRED CPIAUCNS). Margin rate modeled as box-spread financing
-(3M Tsy + 15bps) with a 20% effective tax saving from Section-1256 60/40
-loss recognition. Margin call threshold = 4.0x leverage (Reg-T 25%
-maintenance).
+(3M Tsy + 15bps), no tax benefit assumed — Section-1256 60/40 capital
+losses are only useful if you have offsetting capital gains, which a
+strict hold-forever SPX investor does not. Margin call threshold = 4.0x
+leverage (Reg-T 25% maintenance).
 
 **What this isn't**
 
@@ -120,6 +123,94 @@ with st.sidebar:
             "dd_decay F (decay factor)", 0.5, 3.0, 1.5, step=0.1,
             help="target = max(1.0, T_init − F × max_dd_observed). Higher F = more "
                  "aggressive deleveraging once a drawdown is observed. Default 1.5.")
+        show_adaptive = st.checkbox(
+            "adaptive_dd (cushion-coupled F)", value=False,
+            help="Like dd_decay but F scales with current cushion: F_eff = F × "
+                 "(L_now − 1) / (T_init − 1). Aggressive when leverage is near "
+                 "T_init, mild when already deleveraged. Monotonic-down ratchet.")
+        show_wealth = st.checkbox(
+            "wealth_decay (current-equity glide)", value=False,
+            help="Target linearly interpolates T_init → 1.0x as REAL equity grows "
+                 "from C to wealth_X. Uses CURRENT equity (not HWM): a drawdown "
+                 "raises target back, recovery lowers it again. Pure utility-glide; "
+                 "less safety-architected than dd_decay.")
+        show_adaptive_hybrid = st.checkbox(
+            "adaptive_hybrid (adaptive_dd + wealth)", value=False,
+            help="Combines adaptive_dd's cushion-coupled F + monotonic ratchet "
+                 "with wealth_decay's glide path. Inherits adaptive's IRR-per-"
+                 "safety efficiency and hybrid's unlever-at-wealth_X property.")
+        show_hybrid = st.checkbox(
+            "hybrid (dd + wealth)", value=True,
+            help="target = min(dd_decay_target, wealth_decay_target). dd handles "
+                 "risk events (asymmetric ratchet on drawdowns); wealth enforces "
+                 "the glide path so you reach 1.0x at wealth_X. Either signal can "
+                 "lower target; the more conservative wins.")
+        show_r_hybrid = st.checkbox(
+            "r_hybrid (ratcheted hybrid)", value=False,
+            help="Same as hybrid but wealth_progress ratchets UP only — once "
+                 "target has been lowered by the wealth-glide it stays lowered "
+                 "even if equity drops. Strictly-monotonic-down target.")
+        show_vol_hybrid = st.checkbox(
+            "vol_hybrid (hybrid + vol haircut)", value=False,
+            help="target = hybrid_target − vol_factor × realized_60d_annualized_vol. "
+                 "Deleverages when vol spikes (often leads drawdowns).")
+        show_dip_hybrid = st.checkbox(
+            "dip_hybrid (hybrid + dip floor)", value=False,
+            help="When current drawdown exceeds dip_threshold, target is floored "
+                 "at T_init + dip_bonus (allowed ABOVE T_init temporarily). "
+                 "Contrarian to dd_decay's ratchet during deep drawdowns.")
+        show_rate_hybrid = st.checkbox(
+            "rate_hybrid (hybrid + rate haircut)", value=False,
+            help="target = hybrid_target − rate_factor × max(0, tsy_3m − rate_threshold). "
+                 "Deleverages when carry trade economics deteriorate (high rates).")
+        wealth_X_M = st.slider(
+            "wealth_X target ($M, real)", 1.0, 20.0, 3.0, step=0.5,
+            help="Real-dollar wealth at which wealth_decay / hybrid hit 1.0x. "
+                 "Linear interpolation from T_init at C to 1.0x at wealth_X. "
+                 "Below C: target = T_init. Above wealth_X: target = 1.0x.")
+        vol_factor = st.slider(
+            "vol_hybrid: vol_factor", 0.0, 3.0, 1.0, step=0.1,
+            help="Multiplier on annualized 60d realized vol. 1.0 = a 30% vol "
+                 "regime drops target by 0.30x.")
+        dip_threshold_pct = st.slider(
+            "dip_hybrid: trigger drawdown (%)", 10, 50, 30, step=5,
+            help="Current drawdown above this triggers the dip-buy floor.")
+        dip_bonus = st.slider(
+            "dip_hybrid: bonus leverage", 0.0, 0.5, 0.2, step=0.05,
+            help="Target floored at T_init + dip_bonus while in dip.")
+        rate_threshold_pct = st.slider(
+            "rate_hybrid: rate threshold (% nominal)", 2.0, 10.0, 5.0, step=0.5,
+            help="3M Tsy yield above this triggers haircut.")
+        rate_factor = st.slider(
+            "rate_hybrid: rate_factor", 0.0, 20.0, 5.0, step=1.0,
+            help="With factor=5 and yield 3% above threshold, target drops 0.15x.")
+        show_recal = st.checkbox(
+            "recal_static (periodic re-calibration)", value=False,
+            help="Behaves like static between re-cal events. Every N months, "
+                 "looks up new T_max from a pre-computed table (based on current "
+                 "equity + remaining horizon) and takes additional loan to "
+                 "reach it. Models the 'every N months, re-evaluate' workflow. "
+                 "First run takes ~5s to precompute the table.")
+        show_recal_hybrid = st.checkbox(
+            "recal_hybrid (re-cal + dd ratchet + wealth glide)", value=False,
+            help="Like recal_static but uses hybrid-table values + applies "
+                 "hybrid logic (dd ratchet + wealth glide) between recals. "
+                 "Re-cal events reset state to fresh.")
+        show_recal_adaptive_dd = st.checkbox(
+            "recal_adaptive_dd (re-cal + adaptive_dd between)", value=False,
+            help="Like recal_static but uses adaptive_dd-table values + applies "
+                 "adaptive_dd logic between recals (cushion-coupled F + "
+                 "monotonic ratchet). Re-cal events reset state to fresh.")
+        show_meta_recal = st.checkbox(
+            "meta_recal (pick max-T strategy at each recal)", value=False,
+            help="At each re-cal, looks up T_max for static / dd_decay / "
+                 "adaptive_dd / hybrid and picks the strategy with the "
+                 "highest. Between recals, applies that strategy's logic.")
+        recal_period_months = st.slider(
+            "recal period (months)", 1, 180, 60, step=1,
+            help="How often re-cal strategies re-calibrate. 60 (5y) is the "
+                 "knee. Monthly (1) degrades to relever-like fragility "
+                 "(~30% calls). Longer is safer.")
 
     # GOALS — for probability/target-wealth questions
     with st.expander("Goals & targets"):
@@ -131,7 +222,7 @@ with st.sidebar:
             "Target year", 5, 30, 15,
             help="Year at which to compute P(wealth ≥ target).")
         cap_enabled = st.toggle(
-            "Stop levering up above a wealth cap", value=True,
+            "Stop levering up above a wealth cap", value=False,
             help="When ON, every strategy permanently stops adding leverage the moment "
                  "real wealth crosses the threshold below. Once latched, doesn't toggle "
                  "off if wealth dips below.")
@@ -143,7 +234,7 @@ with st.sidebar:
     # SAFETY — bootstrap + stretch tuning, less often touched
     with st.expander("Safety calibration"):
         n_bootstrap = st.slider(
-            "# synthetic paths", 500, 5000, 1000, step=500,
+            "# synthetic paths", 500, 5000, 500, step=500,
             help="Block-bootstrap synthetic paths used for the 'is this leverage really "
                  "safe?' check. More = tighter call-rate measurement but slower.")
         boot_target_pct = st.slider(
@@ -158,7 +249,7 @@ with st.sidebar:
             "Bootstrap seed", value=42, step=1,
             help="RNG seed for the bootstrap. Same seed = same exact synthetic paths.")
         stretch_F = st.slider(
-            "Drawdown stretch factor F", 1.0, 1.5, 1.0, step=0.05,
+            "Drawdown stretch factor F", 1.0, 1.5, 1.1, step=0.05,
             help="F=1.0 = no stretch. F=1.2 = every historical drawdown 20% deeper. "
                  "Adds a third safety bar (T_stress) when > 1.")
 
@@ -225,12 +316,39 @@ def selected_strategies():
         out.append(("relever", dict(kind="relever")))
     if show_dd:
         out.append(("dd_decay", dict(kind="dd_decay", F=dd_F, floor=1.0)))
+    if show_adaptive:
+        out.append(("adaptive_dd", dict(kind="adaptive_dd", F=dd_F, floor=1.0)))
+    if show_wealth:
+        out.append(("wealth_decay", dict(kind="wealth_decay", floor=1.0)))
+    if show_hybrid:
+        out.append(("hybrid", dict(kind="hybrid", F=dd_F, floor=1.0)))
+    if show_adaptive_hybrid:
+        out.append(("adaptive_hybrid", dict(kind="adaptive_hybrid", F=dd_F, floor=1.0)))
+    if show_r_hybrid:
+        out.append(("r_hybrid", dict(kind="r_hybrid", F=dd_F, floor=1.0)))
+    if show_vol_hybrid:
+        out.append(("vol_hybrid", dict(kind="vol_hybrid", F=dd_F, floor=1.0)))
+    if show_dip_hybrid:
+        out.append(("dip_hybrid", dict(kind="dip_hybrid", F=dd_F, floor=1.0)))
+    if show_rate_hybrid:
+        out.append(("rate_hybrid", dict(kind="rate_hybrid", F=dd_F, floor=1.0)))
+    if show_recal:
+        out.append(("recal_static", dict(kind="recal_static", floor=1.0)))
+    if show_recal_hybrid:
+        out.append(("recal_hybrid", dict(kind="recal_hybrid", F=dd_F, floor=1.0)))
+    if show_recal_adaptive_dd:
+        out.append(("recal_adaptive_dd", dict(kind="recal_adaptive_dd", F=dd_F, floor=1.0)))
+    if show_meta_recal:
+        out.append(("meta_recal", dict(kind="meta_recal", F=dd_F, floor=1.0)))
     return out
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
 def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
-            boot_target, stretch_F, dd_F, cap_real, _paths_key, _paths):
+            boot_target, stretch_F, dd_F, cap_real, wealth_X,
+            vol_factor, dip_threshold, dip_bonus, rate_threshold, rate_factor,
+            recal_period_months,
+            _paths_key, _paths):
     """Cached calibration + projection.
     Cache keys on the leading scalars + tuples; `_paths` is opaque (underscore
     tells Streamlit not to hash). `_paths_key` is the cache identity for the
@@ -245,7 +363,125 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
             strategies.append((name, dict(kind="relever")))
         elif name == "dd_decay":
             strategies.append((name, dict(kind="dd_decay", F=dd_F, floor=1.0)))
+        elif name == "adaptive_dd":
+            strategies.append((name, dict(kind="adaptive_dd", F=dd_F, floor=1.0)))
+        elif name == "wealth_decay":
+            strategies.append((name, dict(kind="wealth_decay", floor=1.0)))
+        elif name == "hybrid":
+            strategies.append((name, dict(kind="hybrid", F=dd_F, floor=1.0)))
+        elif name == "adaptive_hybrid":
+            strategies.append((name, dict(kind="adaptive_hybrid", F=dd_F, floor=1.0)))
+        elif name == "r_hybrid":
+            strategies.append((name, dict(kind="r_hybrid", F=dd_F, floor=1.0)))
+        elif name == "vol_hybrid":
+            strategies.append((name, dict(kind="vol_hybrid", F=dd_F, floor=1.0)))
+        elif name == "dip_hybrid":
+            strategies.append((name, dict(kind="dip_hybrid", F=dd_F, floor=1.0)))
+        elif name == "rate_hybrid":
+            strategies.append((name, dict(kind="rate_hybrid", F=dd_F, floor=1.0)))
+        elif name == "recal_static":
+            strategies.append((name, dict(kind="recal_static", floor=1.0)))
+        elif name == "recal_hybrid":
+            strategies.append((name, dict(kind="recal_hybrid", F=dd_F, floor=1.0)))
+        elif name == "recal_adaptive_dd":
+            strategies.append((name, dict(kind="recal_adaptive_dd", F=dd_F, floor=1.0)))
+        elif name == "meta_recal":
+            strategies.append((name, dict(kind="meta_recal", F=dd_F, floor=1.0)))
     checkpoints = list(checkpoints_tuple)
+
+    # Common kwargs for every simulate/calibration call (overlay params)
+    overlay_kw = dict(
+        vol_factor=vol_factor,
+        dip_threshold=dip_threshold,
+        dip_bonus=dip_bonus,
+        rate_threshold=rate_threshold,
+        rate_factor=rate_factor,
+    )
+
+    # Identify which strategies need which lookup tables
+    recal_strategies_needed = set()
+    for name in strategies_tuple:
+        if name == "recal_static":
+            recal_strategies_needed.add("static")
+        elif name == "recal_hybrid":
+            recal_strategies_needed.add("hybrid")
+        elif name == "recal_adaptive_dd":
+            recal_strategies_needed.add("adaptive_dd")
+        elif name == "meta_recal":
+            for s in ("static", "dd_decay", "adaptive_dd", "hybrid"):
+                recal_strategies_needed.add(s)
+    needs_meta = "meta_recal" in strategies_tuple
+
+    if recal_strategies_needed:
+        e_recal_grid = np.array([
+            max(C * 0.5, 100_000.0),
+            C,
+            C * 3.0,
+            C * 10.0,
+            C * 30.0,
+            C * 100.0,
+        ], dtype=np.float64)
+        h_recal_grid_years = np.array([5.0, 10.0, 15.0, 20.0, 25.0, 30.0])
+        h_recal_grid_years = h_recal_grid_years[h_recal_grid_years <= max_days / TD]
+        if len(h_recal_grid_years) == 0:
+            h_recal_grid_years = np.array([max_days / TD])
+        h_recal_grid_days = (h_recal_grid_years * TD).astype(np.int64)
+        ret_c, tsy_c, cpi_c, avail_c = _paths["calib"]
+        ret_b, tsy_b, cpi_b = _paths["boot"]
+        # Stretched paths if stretch_F > 1
+        ret_s_for_recal = stretch_returns(ret_c, stretch_F) if stretch_F > 1.0 else None
+        # Each recal picks the highest target that's safe BY THE SAME STANDARD as
+        # the rest of the app: hist 0% + bootstrap ≤ boot_target + stretch ≤ 0%.
+        # Strategy-level call rate is a consequence of multi-event exposure (~3%
+        # at boot_target=1% over a 30y/5y schedule).
+        per_strat_tables = {}
+        for kind in recal_strategies_needed:
+            per_strat_tables[kind] = compute_recal_table(
+                ret_c, tsy_c, cpi_c, avail_c, S2, e_recal_grid,
+                h_recal_grid_years, kind=kind, F=dd_F, wealth_X=wealth_X,
+                hist_target=0.0, coarse_n=8, fine_n=8,
+                ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b,
+                boot_target=boot_target,
+                ret_s=ret_s_for_recal, stretch_F=stretch_F)
+        # Build 3D meta-table if needed (in fixed order static / dd_decay / adaptive_dd / hybrid)
+        if needs_meta:
+            meta_kinds = ["static", "dd_decay", "adaptive_dd", "hybrid"]
+            t_recal_tables_meta = np.stack([per_strat_tables[k] for k in meta_kinds])
+            meta_strategy_codes = np.array(
+                [{"static": 0, "dd_decay": 2, "adaptive_dd": 9, "hybrid": 4}[k]
+                 for k in meta_kinds], dtype=np.int64)
+        else:
+            t_recal_tables_meta = np.zeros((1, 1, 1), dtype=np.float64)
+            meta_strategy_codes = np.zeros(1, dtype=np.int64)
+    else:
+        e_recal_grid = np.zeros(1, dtype=np.float64)
+        h_recal_grid_days = np.zeros(1, dtype=np.int64)
+        per_strat_tables = {}
+        t_recal_tables_meta = np.zeros((1, 1, 1), dtype=np.float64)
+        meta_strategy_codes = np.zeros(1, dtype=np.int64)
+    recal_period_days = int(recal_period_months * 21)   # ~21 trading days per month
+
+    def recal_kw_for(name):
+        """Return per-strategy recal kwargs (different table per kind)."""
+        kw = dict(
+            recal_period_days=recal_period_days,
+            e_recal_grid=e_recal_grid,
+            h_recal_grid_days=h_recal_grid_days,
+            t_recal_tables_meta=t_recal_tables_meta,
+            meta_strategy_codes=meta_strategy_codes,
+        )
+        if name == "recal_static":
+            kw["t_recal_table"] = per_strat_tables.get("static",
+                np.zeros((1, 1), dtype=np.float64))
+        elif name == "recal_hybrid":
+            kw["t_recal_table"] = per_strat_tables.get("hybrid",
+                np.zeros((1, 1), dtype=np.float64))
+        elif name == "recal_adaptive_dd":
+            kw["t_recal_table"] = per_strat_tables.get("adaptive_dd",
+                np.zeros((1, 1), dtype=np.float64))
+        else:
+            kw["t_recal_table"] = np.zeros((1, 1), dtype=np.float64)
+        return kw
 
     paths = _paths
     ret_c, tsy_c, cpi_c, avail_c = paths["calib"]
@@ -264,16 +500,21 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         F = spec.get("F", 1.5)
         T_hist = find_max_safe_T_grid(ret_c, tsy_c, cpi_c, kind, 0.0,
                                        C, S, T, S2, max_days, avail=avail_c, F=F,
-                                       cap_real=cap_real)
+                                       cap_real=cap_real, wealth_X=wealth_X,
+                                       **overlay_kw, **recal_kw_for(name))
         boot_at_hist = call_rate(ret_b, tsy_b, cpi_b, kind, T_hist,
-                                  C, S, T, S2, max_days, F=F, cap_real=cap_real)
+                                  C, S, T, S2, max_days, F=F, cap_real=cap_real,
+                                  wealth_X=wealth_X, **overlay_kw, **recal_kw_for(name))
         T_boot = find_max_safe_T_grid(ret_b, tsy_b, cpi_b, kind, boot_target,
                                        C, S, T, S2, max_days, F=F,
-                                       cap_real=cap_real)
+                                       cap_real=cap_real, wealth_X=wealth_X,
+                                       **overlay_kw, **recal_kw_for(name))
         if ret_s is not None:
             T_stress = find_max_safe_T_grid(ret_s, tsy_c, cpi_c, kind, 0.0,
                                              C, S, T, S2, max_days, avail=avail_c,
-                                             F=F, cap_real=cap_real)
+                                             F=F, cap_real=cap_real,
+                                             wealth_X=wealth_X, **overlay_kw,
+                                             **recal_kw_for(name))
         else:
             T_stress = float("inf")
         T_rec = min(T_hist, T_boot, T_stress)
@@ -309,10 +550,11 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         [int(y * TD) for y in checkpoints if int(y * TD) <= max_days],
         dtype=np.int64)
 
-    # Unlev baseline
+    # Unlev baseline (no recal — pure unleveraged)
     real_eq_u, called_u, _, lev_cp_u = simulate(ret_h, tsy_h, cpi_h, "static", 1.0,
                                        C, S, T, S2, max_days, avail=avail_h,
-                                       checkpoint_days=cp_days, cap_real=cap_real)
+                                       checkpoint_days=cp_days, cap_real=cap_real,
+                                       wealth_X=wealth_X, **overlay_kw)
     ps_u = percentiles_at(real_eq_u, checkpoints, max_days)
     proj_results = {"unlev": (1.0, ps_u)}
     safety = {}   # name -> dict of safety metrics at T_rec
@@ -358,7 +600,8 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         real_eq, called_h, peak_lev_h, lev_at_cp = simulate(
             ret_h, tsy_h, cpi_h, kind, T_target,
             C, S, T, S2, max_days, avail=avail_h, F=F,
-            checkpoint_days=cp_days, cap_real=cap_real)
+            checkpoint_days=cp_days, cap_real=cap_real, wealth_X=wealth_X,
+            **overlay_kw, **recal_kw_for(name))
         ps = percentiles_at(real_eq, checkpoints, max_days)
         proj_results[name] = (T_target, ps)
         per_cp[name] = per_checkpoint_arrays(real_eq)
@@ -368,7 +611,7 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
             real_eq_nc, _, _, _ = simulate(
                 ret_h, tsy_h, cpi_h, kind, T_target,
                 C, S, T, S2, max_days, avail=avail_h, F=F,
-                cap_real=float("inf"))
+                cap_real=float("inf"), wealth_X=wealth_X, **overlay_kw, **recal_kw_for(name))
             proj_no_cap[name] = per_checkpoint_arrays(real_eq_nc)
 
         # Leverage percentiles at each checkpoint (only over surviving paths)
@@ -394,7 +637,8 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         # Safety on bootstrap (full horizon synthetic paths)
         _, called_b, peak_lev_b, _ = simulate(
             ret_b, tsy_b, cpi_b, kind, T_target,
-            C, S, T, S2, max_days, F=F, cap_real=cap_real)
+            C, S, T, S2, max_days, F=F, cap_real=cap_real, wealth_X=wealth_X,
+            **overlay_kw, **recal_kw_for(name))
 
         # Peak leverage percentiles on SURVIVORS only (called paths hit >= 4.0x by definition)
         survivors_h = peak_lev_h[~called_h]
@@ -402,13 +646,15 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         # Calibration paths (full horizon) for additional context
         _, called_cf, peak_lev_cf, _ = simulate(
             ret_c, tsy_c, cpi_c, kind, T_target,
-            C, S, T, S2, max_days, avail=avail_c, F=F, cap_real=cap_real)
+            C, S, T, S2, max_days, avail=avail_c, F=F, cap_real=cap_real,
+            wealth_X=wealth_X, **overlay_kw, **recal_kw_for(name))
 
         # Stress test (stretched drawdowns), if enabled
         if ret_s is not None:
             _, called_s, peak_lev_s, _ = simulate(
                 ret_s, tsy_c, cpi_c, kind, T_target,
-                C, S, T, S2, max_days, avail=avail_c, F=F, cap_real=cap_real)
+                C, S, T, S2, max_days, avail=avail_c, F=F, cap_real=cap_real,
+                wealth_X=wealth_X, **overlay_kw, **recal_kw_for(name))
             survivors_s = peak_lev_s[~called_s]
             stress_calls = int(called_s.sum())
             n_stress = len(called_s)
@@ -454,9 +700,16 @@ if run or "results" not in st.session_state:
             strategies_tuple = tuple(name for name, _ in selected_strategies())
             paths_key = (max_days, n_bootstrap, block_years_int, int(seed))
             cap_real_val = float(cap_wealth_M) * 1e6 if cap_enabled else float("inf")
+            wealth_X_val = float(wealth_X_M) * 1e6
+            dip_threshold_val = float(dip_threshold_pct) / 100.0
+            rate_threshold_val = float(rate_threshold_pct) / 100.0
             calibrated, proj_results, safety, per_cp, worst, lev_summary, proj_no_cap = compute(
                 C, S, T, S2, max_days, tuple(checkpoints),
                 strategies_tuple, boot_target, stretch_F, dd_F, cap_real_val,
+                wealth_X_val,
+                float(vol_factor), dip_threshold_val, float(dip_bonus),
+                rate_threshold_val, float(rate_factor),
+                int(recal_period_months),
                 paths_key, paths)
             elapsed = time.time() - t0
         st.session_state["results"] = dict(
@@ -474,7 +727,7 @@ if run or "results" not in st.session_state:
             params=dict(C=C, S=S, T=T, S2=S2,
                         max_years=max_years, n_bootstrap=n_bootstrap,
                         boot_target_pct=boot_target_pct, block_years=block_years,
-                        stretch_F=stretch_F, dd_F=dd_F),
+                        stretch_F=stretch_F, dd_F=dd_F, wealth_X_M=wealth_X_M),
             elapsed=elapsed,
         )
 
@@ -518,7 +771,8 @@ if "results" in st.session_state:
 
     st.success(
         f"Computed in {res['elapsed']:.1f}s — "
-        f"C=${p['C']:,}, S=${p['S']:,}/yr (×{p['T']:g}y), S2=${p['S2']:,}/yr, "
+        f"C=\\${p['C']:,}, S=\\${p['S']:,}/yr (×{p['T']:g}y), "
+        f"S2=\\${p['S2']:,}/yr, "
         f"horizon={p['max_years']:g}y. "
         f"Showing: **{mode_label}**"
     )
@@ -853,6 +1107,8 @@ if "results" in st.session_state:
     st.caption(
         "Static drifts down naturally as DCA dilutes leverage. Relever holds at target. "
         "dd_decay ratchets target down on observed drawdowns. "
+        "wealth_decay glides target toward 1.0x as REAL equity grows from C to wealth_X "
+        "(rises again on drawdowns). hybrid takes the lower of dd_decay and wealth_decay. "
         "Unlev is fixed at 1.000x."
     )
     lev_summary = res.get("lev_summary", {})
@@ -877,7 +1133,6 @@ if "results" in st.session_state:
         if ys_lev:
             ax.plot(ys_lev, vals, marker="o", label=name)
     ax.axhline(1.0, color="grey", linestyle=":", alpha=0.5, label="unleveraged")
-    ax.axhline(4.0, color="red", linestyle=":", alpha=0.4, label="call threshold (4.0x)")
     ax.set_xlabel("Years")
     ax.set_ylabel("Leverage (median)")
     ax.set_ylim(bottom=0.95)
