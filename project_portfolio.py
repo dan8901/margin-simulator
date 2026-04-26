@@ -443,7 +443,11 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
     peak_lev = np.full(K, float(T_init))
 
     real_eq = np.full((K, max_days + 1), np.nan)
-    lev_at_cp = np.full((K, n_cp), np.nan)
+    # Per-checkpoint leverage capture: shape (K, n_cp, 2) where
+    # [k, c, 0] = pre-rebalance (drift result), [k, c, 1] = post-rebalance.
+    # For non-recal kinds, post == pre. For recal kinds, post shows the
+    # lift effect at recal days. NaN if the path was called/out-of-data.
+    lev_at_cp = np.full((K, n_cp, 2), np.nan)
     for k in range(K):
         real_eq[k, 0] = C
 
@@ -500,7 +504,11 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
             if is_cp:
                 eq_pre = stocks[k] - loan[k]
                 if eq_pre > 0.0:
-                    lev_at_cp[k, cp_idx] = stocks[k] / eq_pre
+                    lev_pre = stocks[k] / eq_pre
+                    lev_at_cp[k, cp_idx, 0] = lev_pre
+                    # Default post == pre; recal kinds overwrite [1] below
+                    # after the rebalance step
+                    lev_at_cp[k, cp_idx, 1] = lev_pre
 
             # Latch the cap once real wealth crosses it (permanent flag)
             eq_pre_rebal = stocks[k] - loan[k]
@@ -1030,12 +1038,12 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                     peak_lev[k] = lev_now
             real_eq[k, d] = eq * cpi[k, 0] / cpi[k, d]
 
-            # For recal kinds, overwrite the pre-rebalance leverage capture
-            # with the POST-rebalance value so the chart visualizes the
-            # recal lift. Other kinds keep the pre-rebalance value (showing
-            # natural drift between rebalances).
+            # For recal kinds, also write the POST-rebalance leverage to
+            # the [1] slot so the chart can visualize the recal lift as
+            # a vertical jump from pre to post at each cp day. Non-recal
+            # kinds keep post == pre (already initialized above).
             if is_cp and kind_code >= 11 and eq > 0.0:
-                lev_at_cp[k, cp_idx] = stocks[k] / eq
+                lev_at_cp[k, cp_idx, 1] = stocks[k] / eq
 
         if is_cp:
             cp_idx += 1

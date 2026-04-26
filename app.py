@@ -735,21 +735,29 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                 init_strat_idx=init_strat_idx)
             proj_no_cap[name] = per_checkpoint_arrays(real_eq_nc)
 
-        # Leverage percentiles at each checkpoint (only over surviving paths)
+        # Leverage percentiles at each checkpoint (only over surviving paths).
+        # lev_at_cp now shape (K, n_cp, 2): [pre, post]. For non-recal kinds
+        # post == pre. For recal kinds, post shows the lift effect.
         lev_summary[name] = {}
         for ci, y in enumerate(checkpoints):
             if ci >= cp_days.shape[0]:
                 continue
-            col = lev_at_cp[:, ci]
-            valid = ~np.isnan(col)
+            col_pre = lev_at_cp[:, ci, 0]
+            col_post = lev_at_cp[:, ci, 1]
+            valid = ~np.isnan(col_pre)
             if not valid.any():
                 continue
-            arr = col[valid]
+            arr_pre = col_pre[valid]
+            arr_post = col_post[valid]
             lev_summary[name][y] = dict(
-                p25=float(np.percentile(arr, 25)),
-                p50=float(np.percentile(arr, 50)),
-                p75=float(np.percentile(arr, 75)),
-                p90=float(np.percentile(arr, 90)),
+                # Pre-rebalance percentiles (drift result, same as before)
+                p25=float(np.percentile(arr_pre, 25)),
+                p50=float(np.percentile(arr_pre, 50)),
+                p75=float(np.percentile(arr_pre, 75)),
+                p90=float(np.percentile(arr_pre, 90)),
+                # Post-rebalance p50 (only different from p50 for recal kinds
+                # at recal days) — used by chart to visualize the lift
+                p50_post=float(np.percentile(arr_post, 50)),
             )
 
         # Worst path at each checkpoint year (lowest real wealth that year)
@@ -1241,7 +1249,9 @@ if "results" in st.session_state:
         "dd_decay ratchets target down on observed drawdowns. "
         "wealth_decay glides target toward 1.0x as REAL equity grows from C to wealth_X "
         "(rises again on drawdowns). hybrid takes the lower of dd_decay and wealth_decay. "
-        "Unlev is fixed at 1.000x."
+        "Unlev is fixed at 1.000x. "
+        "**For recal_X strategies**, vertical bars and ▲ markers show the "
+        "median lift at each recal event (pre-rebalance drift → post-rebalance target)."
     )
     lev_summary = res.get("lev_summary", {})
     rows = []
@@ -1253,17 +1263,31 @@ if "results" in st.session_state:
         rows.append(row)
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
-    # Median leverage trajectory across strategies
+    # Median leverage trajectory across strategies. For recal kinds, draw
+    # vertical "lift bars" at each checkpoint year showing the jump from
+    # pre-rebalance (drift result) to post-rebalance (after the recal lift).
     fig, ax = plt.subplots(figsize=(8, 4))
+    RECAL_KINDS = {"recal_static", "recal_hybrid", "recal_adaptive_dd",
+                   "meta_recal"}
     for name in strategy_names:
-        ys_lev, vals = [], []
+        ys_lev, vals_pre, vals_post = [], [], []
         for y in res["checkpoints"]:
             d = lev_summary.get(name, {}).get(y)
             if d:
                 ys_lev.append(y)
-                vals.append(d["p50"])
-        if ys_lev:
-            ax.plot(ys_lev, vals, marker="o", label=name)
+                vals_pre.append(d["p50"])
+                vals_post.append(d.get("p50_post", d["p50"]))
+        if not ys_lev:
+            continue
+        line, = ax.plot(ys_lev, vals_pre, marker="o", label=name)
+        if name in RECAL_KINDS:
+            color = line.get_color()
+            for y, vp, vq in zip(ys_lev, vals_pre, vals_post):
+                if abs(vq - vp) > 1e-4:
+                    # Vertical lift bar from pre (drift result) up to post (lift)
+                    ax.plot([y, y], [vp, vq], color=color, linewidth=2,
+                            alpha=0.6, solid_capstyle="butt")
+                    ax.scatter([y], [vq], color=color, marker="^", s=40, zorder=5)
     ax.axhline(1.0, color="grey", linestyle=":", alpha=0.5, label="unleveraged")
     ax.set_xlabel("Years")
     ax.set_ylabel("Leverage (median)")
