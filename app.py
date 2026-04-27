@@ -794,10 +794,10 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
     lev_summary = {"unlev": {y: dict(p25=1.0, p50=1.0, p75=1.0, p90=1.0)
                               for y in all_years_set}}
     def collect_worst_per_year(real_eq_arr, called_arr):
-        """For each checkpoint year, find the historical path with the lowest
-        real wealth AT THAT YEAR among paths still alive there."""
+        """For each integer year up to the horizon, find the historical path
+        with the lowest real wealth AT THAT YEAR among paths still alive there."""
         out = {}
-        for y in checkpoints:
+        for y in all_years_set:
             d_idx = int(y * TD)
             if d_idx > max_days:
                 continue
@@ -931,6 +931,264 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
         )
 
     return calibrated, proj_results, safety, per_cp, worst, lev_summary, proj_no_cap
+
+
+def _capture_per_cp(real_eq, cpi_factor, checkpoints_tuple, max_days):
+    """Per-checkpoint capture: rows where real_eq is non-NaN at the day index.
+    Returns dict[float year] -> {"real": np.ndarray, "nominal": np.ndarray}.
+    """
+    out = {}
+    for y in checkpoints_tuple:
+        d_idx = int(y * TD)
+        if d_idx > max_days:
+            continue
+        col = real_eq[:, d_idx]
+        valid = ~np.isnan(col)
+        if not valid.any():
+            continue
+        real_vals = col[valid]
+        nom_vals = real_vals * cpi_factor[valid, d_idx]
+        out[float(y)] = dict(real=real_vals, nominal=nom_vals)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def compute_t_sweep(
+    C, S, S2, max_days, checkpoints_tuple,
+    strategy_kind, strategy_F,
+    boot_target, stretch_F, dd_F, cap_real, wealth_X,
+    vol_factor, dip_threshold, dip_bonus, rate_threshold, rate_factor,
+    recal_period_months, wealth_glide_exp, broker_bump_days,
+    _paths_key, _paths,
+    t_values=tuple(range(16)),
+):
+    """For each T_val in t_values, run full well-defended calibration (hist +
+    boot + stretch) for the given single strategy at savings duration T_val,
+    then project on historical paths and capture wealth arrays at every
+    checkpoint year.
+
+    Returns: dict[int T_val] -> {
+        "T_rec": float, "T_hist": float, "T_boot": float,
+        "T_stress": float | None,
+        "init_strat_idx": int,
+        "init_base_kind": str | None,
+        "per_cp": dict[float year -> {"real": np.ndarray, "nominal": np.ndarray}],
+    }
+
+    `cap_real` should be a float (cap value or float('inf')); per-path arrays
+    are not supported here because the cache key requires hashable args.
+    """
+    paths = _paths
+    ret_c, tsy_c, cpi_c, avail_c = paths["calib"]
+    ret_h, tsy_h, cpi_h, avail_h, entry_dates_h = paths["proj"]
+    ret_b, tsy_b, cpi_b = paths["boot"]
+
+    overlay_kw = dict(
+        vol_factor=vol_factor,
+        dip_threshold=dip_threshold,
+        dip_bonus=dip_bonus,
+        rate_threshold=rate_threshold,
+        rate_factor=rate_factor,
+        wealth_glide_exp=wealth_glide_exp,
+        broker_bump_days=broker_bump_days,
+    )
+
+    META_KINDS = ["static", "hybrid", "adaptive_hybrid"]
+    META_CODES = np.array([0, 4, 10], dtype=np.int64)
+    BASE_KIND_FOR_RECAL = {
+        "recal_static": "static",
+        "recal_hybrid": "hybrid",
+        "recal_adaptive_dd": "adaptive_dd",
+    }
+
+    ret_s = stretch_returns(ret_h, stretch_F) if stretch_F > 1.0 else None
+
+    needs_recal_table = (strategy_kind in BASE_KIND_FOR_RECAL
+                         or strategy_kind == "meta_recal")
+    if needs_recal_table:
+        e_recal_grid = np.array([
+            max(C * 0.5, 100_000.0), C, C * 3.0, C * 10.0,
+            C * 30.0, C * 100.0,
+        ], dtype=np.float64)
+        h_recal_grid_years = np.array([5.0, 10.0, 15.0, 20.0, 25.0, 30.0])
+        h_recal_grid_years = h_recal_grid_years[h_recal_grid_years <= max_days / TD]
+        if len(h_recal_grid_years) == 0:
+            h_recal_grid_years = np.array([max_days / TD])
+        h_recal_grid_days = (h_recal_grid_years * TD).astype(np.int64)
+    else:
+        e_recal_grid = np.zeros(1, dtype=np.float64)
+        h_recal_grid_days = np.zeros(1, dtype=np.int64)
+        h_recal_grid_years = np.zeros(1, dtype=np.float64)
+
+    score_horizon_days_local = int(recal_period_months * 21)
+    recal_period_days_local = int(recal_period_months * 21)
+
+    cp_days = np.array(
+        [int(y * TD) for y in checkpoints_tuple if int(y * TD) <= max_days],
+        dtype=np.int64,
+    )
+    cpi_factor = cpi_h / cpi_h[:, 0:1]   # rows align with ret_h
+
+    results = {}
+    for T_val in t_values:
+        T_val = int(T_val)
+        if strategy_kind == "unlev":
+            real_eq, _, _, _ = simulate(
+                ret_h, tsy_h, cpi_h, "static", 1.0,
+                C, S, T_val, S2, max_days, avail=avail_h,
+                checkpoint_days=cp_days, cap_real=cap_real,
+                wealth_X=wealth_X, **overlay_kw,
+            )
+            results[T_val] = dict(
+                T_rec=1.0, T_hist=1.0, T_boot=1.0, T_stress=None,
+                init_strat_idx=0, init_base_kind=None,
+                per_cp=_capture_per_cp(real_eq, cpi_factor,
+                                        checkpoints_tuple, max_days),
+            )
+            continue
+
+        if strategy_kind in BASE_KIND_FOR_RECAL:
+            calib_kind = BASE_KIND_FOR_RECAL[strategy_kind]
+        elif strategy_kind == "meta_recal":
+            calib_kind = None
+        else:
+            calib_kind = strategy_kind
+
+        if calib_kind is not None:
+            T_hist = find_max_safe_T_grid(
+                ret_h, tsy_h, cpi_h, calib_kind, 0.0,
+                C, S, T_val, S2, max_days, avail=avail_h, F=strategy_F,
+                cap_real=cap_real, wealth_X=wealth_X, **overlay_kw,
+            )
+            T_boot = find_max_safe_T_grid(
+                ret_b, tsy_b, cpi_b, calib_kind, boot_target,
+                C, S, T_val, S2, max_days, F=strategy_F,
+                cap_real=cap_real, wealth_X=wealth_X, **overlay_kw,
+            )
+            if ret_s is not None:
+                T_stress = find_max_safe_T_grid(
+                    ret_s, tsy_h, cpi_h, calib_kind, 0.0,
+                    C, S, T_val, S2, max_days, avail=avail_h, F=strategy_F,
+                    cap_real=cap_real, wealth_X=wealth_X, **overlay_kw,
+                )
+            else:
+                T_stress = float("inf")
+            T_rec = min(T_hist, T_boot, T_stress)
+            init_strat_idx = 0
+            init_base_kind = BASE_KIND_FOR_RECAL.get(strategy_kind)
+        else:
+            per_base = {}
+            for base_kind in META_KINDS:
+                T_h = find_max_safe_T_grid(
+                    ret_h, tsy_h, cpi_h, base_kind, 0.0,
+                    C, S, T_val, S2, max_days, avail=avail_h, F=strategy_F,
+                    cap_real=cap_real, wealth_X=wealth_X, **overlay_kw,
+                )
+                T_bo = find_max_safe_T_grid(
+                    ret_b, tsy_b, cpi_b, base_kind, boot_target,
+                    C, S, T_val, S2, max_days, F=strategy_F,
+                    cap_real=cap_real, wealth_X=wealth_X, **overlay_kw,
+                )
+                if ret_s is not None:
+                    T_st = find_max_safe_T_grid(
+                        ret_s, tsy_h, cpi_h, base_kind, 0.0,
+                        C, S, T_val, S2, max_days, avail=avail_h, F=strategy_F,
+                        cap_real=cap_real, wealth_X=wealth_X, **overlay_kw,
+                    )
+                else:
+                    T_st = float("inf")
+                T_rec_base = min(T_h, T_bo, T_st)
+                score_horizon = min(score_horizon_days_local, max_days)
+                real_eq_b, called_b, _, _ = simulate(
+                    ret_c, tsy_c, cpi_c, base_kind, T_rec_base,
+                    C, S, T_val, S2, score_horizon,
+                    avail=np.minimum(avail_c, score_horizon), F=strategy_F,
+                    cap_real=cap_real, wealth_X=wealth_X, **overlay_kw,
+                )
+                terminal = real_eq_b[:, score_horizon]
+                valid = ~(np.isnan(terminal) | called_b)
+                score = (float(np.nanpercentile(terminal[valid], 50))
+                         if valid.any() else float("-inf"))
+                per_base[base_kind] = dict(T_h=T_h, T_bo=T_bo, T_st=T_st,
+                                            T_rec=T_rec_base, score=score)
+            scores = [per_base[k]["score"] for k in META_KINDS]
+            winner_idx = int(np.argmax(scores))
+            winner_kind = META_KINDS[winner_idx]
+            winner = per_base[winner_kind]
+            T_rec = winner["T_rec"]
+            T_hist = winner["T_h"]
+            T_boot = winner["T_bo"]
+            T_stress = winner["T_st"] if ret_s is not None else None
+            init_strat_idx = winner_idx
+            init_base_kind = winner_kind
+
+        if strategy_kind in BASE_KIND_FOR_RECAL:
+            ret_s_for_recal = stretch_returns(ret_h, stretch_F) if stretch_F > 1.0 else None
+            base = BASE_KIND_FOR_RECAL[strategy_kind]
+            t_table, _ = compute_recal_table(
+                ret_h, tsy_h, cpi_h, avail_h, S2,
+                e_recal_grid, h_recal_grid_years, kind=base, F=strategy_F,
+                wealth_X=wealth_X, hist_target=0.0, coarse_n=8, fine_n=8,
+                ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b, boot_target=boot_target,
+                ret_s=ret_s_for_recal, stretch_F=stretch_F,
+                score_horizon_days=score_horizon_days_local,
+                wealth_glide_exp=wealth_glide_exp,
+            )
+            recal_kw = dict(
+                recal_period_days=recal_period_days_local,
+                e_recal_grid=e_recal_grid,
+                h_recal_grid_days=h_recal_grid_days,
+                t_recal_table=t_table,
+                t_recal_tables_meta=np.zeros((1, 1, 1), dtype=np.float64),
+                meta_score_tables=np.zeros((1, 1, 1), dtype=np.float64),
+                meta_strategy_codes=np.zeros(1, dtype=np.int64),
+            )
+        elif strategy_kind == "meta_recal":
+            ret_s_for_recal = stretch_returns(ret_h, stretch_F) if stretch_F > 1.0 else None
+            per_strat = {}
+            for k in META_KINDS:
+                t_table_k, score_table_k = compute_recal_table(
+                    ret_h, tsy_h, cpi_h, avail_h, S2,
+                    e_recal_grid, h_recal_grid_years, kind=k, F=strategy_F,
+                    wealth_X=wealth_X, hist_target=0.0, coarse_n=8, fine_n=8,
+                    ret_b=ret_b, tsy_b=tsy_b, cpi_b=cpi_b, boot_target=boot_target,
+                    ret_s=ret_s_for_recal, stretch_F=stretch_F,
+                    score_horizon_days=score_horizon_days_local,
+                    wealth_glide_exp=wealth_glide_exp,
+                )
+                per_strat[k] = (t_table_k, score_table_k)
+            t_meta = np.stack([per_strat[k][0] for k in META_KINDS])
+            s_meta = np.stack([per_strat[k][1] for k in META_KINDS])
+            recal_kw = dict(
+                recal_period_days=recal_period_days_local,
+                e_recal_grid=e_recal_grid,
+                h_recal_grid_days=h_recal_grid_days,
+                t_recal_table=np.zeros((1, 1), dtype=np.float64),
+                t_recal_tables_meta=t_meta,
+                meta_score_tables=s_meta,
+                meta_strategy_codes=META_CODES,
+            )
+        else:
+            recal_kw = {}
+
+        real_eq, _, _, _ = simulate(
+            ret_h, tsy_h, cpi_h, strategy_kind, T_rec,
+            C, S, T_val, S2, max_days, avail=avail_h, F=strategy_F,
+            checkpoint_days=cp_days, cap_real=cap_real, wealth_X=wealth_X,
+            **overlay_kw, **recal_kw,
+            init_strat_idx=init_strat_idx,
+        )
+        results[T_val] = dict(
+            T_rec=float(T_rec),
+            T_hist=float(T_hist),
+            T_boot=float(T_boot),
+            T_stress=(float(T_stress) if T_stress is not None and T_stress != float("inf") else None),
+            init_strat_idx=init_strat_idx,
+            init_base_kind=init_base_kind,
+            per_cp=_capture_per_cp(real_eq, cpi_factor, checkpoints_tuple, max_days),
+        )
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1289,10 +1547,12 @@ if "results" in st.session_state:
         return min(range(len(cps)), key=lambda i: abs(float(cps[i]) - float(target)))
 
     st.subheader("Wealth distribution at a chosen checkpoint")
+    _max_years_int = int(res["params"]["max_years"])
+    _hist_year_options = [float(y) for y in range(1, _max_years_int + 1)]
     hist_year = st.selectbox(
         "Checkpoint year for histogram",
-        options=res["checkpoints"],
-        index=_nearest_cp_idx(res["checkpoints"], target_year),
+        options=_hist_year_options,
+        index=_nearest_cp_idx(_hist_year_options, target_year),
         format_func=lambda x: f"{int(x)}y",
     )
     _non_unlev = [s for s in strategy_names if s != "unlev"]
@@ -1393,8 +1653,8 @@ if "results" in st.session_state:
     with col_year:
         worst_year = st.selectbox(
             "Worst-at-year (horizon)",
-            options=res["checkpoints"],
-            index=_nearest_cp_idx(res["checkpoints"], target_year),
+            options=_hist_year_options,
+            index=_nearest_cp_idx(_hist_year_options, target_year),
             format_func=lambda x: f"{int(x)}y",
             key="worst_year",
         )
