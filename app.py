@@ -103,7 +103,7 @@ PERSISTED_KEYS = [
     "dip_threshold_pct", "dip_bonus", "rate_threshold_pct", "rate_factor",
     "recal_period_months",
     # Goals
-    "target_wealth_M", "target_year", "cap_enabled", "cap_wealth_M",
+    "target_wealths_str", "target_year", "cap_enabled", "cap_wealth_M",
     # Financing
     "broker_bump_years",
     # Safety
@@ -279,10 +279,23 @@ with st.sidebar:
 
     # GOALS — for probability/target-wealth questions
     with st.expander("Goals & targets"):
-        target_wealth_M = st.number_input(
-            "Target wealth ($M)", value=3.0, step=0.5, min_value=0.1, key="target_wealth_M",
-            help="Used by the 'Probability of reaching ≥ $X by year Y' panel and "
-                 "marked on the histogram with a red dashed line.")
+        target_wealths_str = st.text_input(
+            "Target wealths ($M, comma-separated)", value="1, 2, 3",
+            key="target_wealths_str",
+            help="Wealth thresholds for the 'Probability of reaching ≥ $X' "
+                 "chart. One subplot per target. The first target is also "
+                 "marked on the wealth histogram with a red dashed line.")
+        try:
+            target_wealths_M = [float(s.strip()) for s in
+                                 target_wealths_str.split(",") if s.strip()]
+            target_wealths_M = [t for t in target_wealths_M if t > 0]
+        except ValueError:
+            st.error("Could not parse target wealths — using default [1, 2, 3].")
+            target_wealths_M = [1.0, 2.0, 3.0]
+        if not target_wealths_M:
+            target_wealths_M = [1.0, 2.0, 3.0]
+        # Backwards-compat name used by histogram
+        target_wealth_M = target_wealths_M[0]
         target_year = st.slider(
             "Target year", 5, 30, 15, key="target_year",
             help="Year at which to compute P(wealth ≥ target).")
@@ -734,11 +747,21 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
     # cpi factor per path/day (used for nominal conversion)
     cpi_factor = cpi_h / cpi_h[:, 0:1]
 
+    # Sample wealth at EVERY integer year (1..max_years) for dense charts;
+    # the user-set `checkpoints` list still drives table iteration. Set of
+    # years is the union of integer years and any user-checkpoint that
+    # happens to be fractional.
+    max_years_int = int(max_days / TD)
+    all_years_set = sorted(set([float(i) for i in range(1, max_years_int + 1)])
+                            | set(float(y) for y in checkpoints))
+
     def per_checkpoint_arrays(real_eq):
-        """For each checkpoint, returns dict y -> dict(real, nominal, entry_idx)
-        where arrays are for paths that have valid (non-NaN) data at that day."""
+        """For each year in `all_years_set`, returns dict y -> dict(real,
+        nominal, entry_idx) where arrays are for paths that have valid
+        (non-NaN) data at that day. Keyed by both integer years (for
+        dense charts) and the user's checkpoint years (for tables)."""
         out = {}
-        for y in checkpoints:
+        for y in all_years_set:
             d_idx = int(y * TD)
             if d_idx > max_days:
                 continue
@@ -754,7 +777,7 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
 
     # Day indices for the user's checkpoints (used to capture leverage)
     cp_days = np.array(
-        [int(y * TD) for y in checkpoints if int(y * TD) <= max_days],
+        [int(y * TD) for y in all_years_set if int(y * TD) <= max_days],
         dtype=np.int64)
 
     # Unlev baseline (no recal — pure unleveraged)
@@ -762,14 +785,14 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                                        C, S, T, S2, max_days, avail=avail_h,
                                        checkpoint_days=cp_days, cap_real=cap_real,
                                        wealth_X=wealth_X, **overlay_kw)
-    ps_u = percentiles_at(real_eq_u, checkpoints, max_days)
+    ps_u = percentiles_at(real_eq_u, list(all_years_set), max_days)
     proj_results = {"unlev": (1.0, ps_u)}
     safety = {}   # name -> dict of safety metrics at T_rec
     per_cp = {"unlev": per_checkpoint_arrays(real_eq_u)}
     worst = {}   # name -> dict(entry_date, real_traj, nominal_traj, called)
-    # Leverage percentiles at each checkpoint, keyed by strategy
+    # Leverage percentiles at each year, keyed by strategy
     lev_summary = {"unlev": {y: dict(p25=1.0, p50=1.0, p75=1.0, p90=1.0)
-                              for y in checkpoints}}
+                              for y in all_years_set}}
     def collect_worst_per_year(real_eq_arr, called_arr):
         """For each checkpoint year, find the historical path with the lowest
         real wealth AT THAT YEAR among paths still alive there."""
@@ -811,7 +834,7 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
             checkpoint_days=cp_days, cap_real=cap_real, wealth_X=wealth_X,
             **overlay_kw, **recal_kw_for(name),
             init_strat_idx=init_strat_idx)
-        ps = percentiles_at(real_eq, checkpoints, max_days)
+        ps = percentiles_at(real_eq, list(all_years_set), max_days)
         proj_results[name] = (T_target, ps)
         per_cp[name] = per_checkpoint_arrays(real_eq)
 
@@ -825,11 +848,12 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
                 init_strat_idx=init_strat_idx)
             proj_no_cap[name] = per_checkpoint_arrays(real_eq_nc)
 
-        # Leverage percentiles at each checkpoint (only over surviving paths).
+        # Leverage percentiles at each year (only over surviving paths).
         # lev_at_cp now shape (K, n_cp, 2): [pre, post]. For non-recal kinds
-        # post == pre. For recal kinds, post shows the lift effect.
+        # post == pre. For recal kinds, post shows the lift effect. The
+        # year list MUST match the order used to build cp_days.
         lev_summary[name] = {}
-        for ci, y in enumerate(checkpoints):
+        for ci, y in enumerate(all_years_set):
             if ci >= cp_days.shape[0]:
                 continue
             col_pre = lev_at_cp[:, ci, 0]
@@ -1105,13 +1129,13 @@ if "results" in st.session_state:
     fig, ax = plt.subplots(figsize=(8, 4))
     for name in strategy_names:
         ys, vals = [], []
-        for y in res["checkpoints"]:
+        for y in sorted(res["per_cp"].get(name, {}).keys()):
             ps = get_pct(name, y)
             if ps:
                 ys.append(y)
                 vals.append(ps[2] / 1e6)
         if ys:
-            ax.plot(ys, vals, marker="o", label=name)
+            ax.plot(ys, vals, marker=".", label=name)
     ax.set_xlabel("Years")
     ax.set_ylabel(f"Wealth (M USD, {mode_label.split(' ')[0]})")
     ax.legend()
@@ -1136,7 +1160,8 @@ if "results" in st.session_state:
             on_arrs = res["per_cp"].get(compare_strat, {})
             off_arrs = res["proj_no_cap"].get(compare_strat, {})
             ys, on_p50, off_p50, on_p10, off_p10, on_p90, off_p90 = [], [], [], [], [], [], []
-            for y in res["checkpoints"]:
+            common_years = sorted(set(on_arrs.keys()) & set(off_arrs.keys()))
+            for y in common_years:
                 a_on = on_arrs.get(y, {}).get(mode) if isinstance(on_arrs.get(y), dict) else None
                 a_off = off_arrs.get(y, {}).get(mode) if isinstance(off_arrs.get(y), dict) else None
                 if a_on is None or a_off is None or len(a_on) == 0 or len(a_off) == 0:
@@ -1152,10 +1177,10 @@ if "results" in st.session_state:
                 fig, ax = plt.subplots(figsize=(8, 4.5))
                 ax.fill_between(ys, on_p10, on_p90, alpha=0.18, color="C0",
                                 label="cap-on  p10-p90")
-                ax.plot(ys, on_p50, marker="o", color="C0", label="cap-on  p50")
+                ax.plot(ys, on_p50, marker=".", color="C0", label="cap-on  p50")
                 ax.fill_between(ys, off_p10, off_p90, alpha=0.18, color="C1",
                                 label="cap-off p10-p90")
-                ax.plot(ys, off_p50, marker="s", color="C1", label="cap-off p50")
+                ax.plot(ys, off_p50, marker=".", color="C1", label="cap-off p50")
                 ax.axhline(cap_M, color="grey", linestyle=":", alpha=0.5,
                            label=f"cap = {cap_M:.1f}M")
                 ax.set_xlabel("Years")
@@ -1171,31 +1196,44 @@ if "results" in st.session_state:
                     "deeper drawdowns and more margin-call risk on unlucky ones."
                 )
 
-    # --- Probability of reaching target wealth ---
-    st.subheader(
-        f"Probability of reaching ≥ ${target_wealth_M:.1f}M by year {target_year}"
-    )
-    target_dollars = float(target_wealth_M) * 1e6
-    prob_rows = []
-    for name in strategy_names:
-        cp = res["per_cp"].get(name, {}).get(float(target_year))
-        if cp is None or len(cp[mode]) == 0:
-            prob_rows.append({"Strategy": name, "T": f"{get_T(name):.3f}x",
-                              "P(≥ target)": "—", "n_paths": 0})
-            continue
-        arr = cp[mode]
-        prob = float((arr >= target_dollars).mean())
-        prob_rows.append({
-            "Strategy": name,
-            "T": f"{get_T(name):.3f}x",
-            "P(≥ target)": f"{100 * prob:.1f}%",
-            "n_paths": len(arr),
-        })
-    st.dataframe(pd.DataFrame(prob_rows), hide_index=True, use_container_width=True)
-    st.caption(
-        f"Fraction of historical paths whose {mode} wealth at year {target_year} "
-        f"reached or exceeded ${target_wealth_M:.1f}M. Adjust target $ and year in the sidebar."
-    )
+    # --- Probability of reaching target wealth across years ---
+    targets_label = ", ".join(f"${t:.1f}M" for t in target_wealths_M)
+    st.subheader(f"Probability of reaching ≥ {targets_label} by year N")
+
+    n_targets = len(target_wealths_M)
+    fig, axes = plt.subplots(n_targets, 1, figsize=(8, 3 * n_targets),
+                              sharex=True, squeeze=False)
+    axes = axes[:, 0]
+    plotted_any = False
+    for ax_i, t_M in zip(axes, target_wealths_M):
+        target_dollars = float(t_M) * 1e6
+        for name in strategy_names:
+            cp_dict = res["per_cp"].get(name, {})
+            ys, probs = [], []
+            for y in sorted(cp_dict.keys()):
+                cp = cp_dict[y]
+                if cp is None or len(cp[mode]) == 0:
+                    continue
+                arr = cp[mode]
+                ys.append(y)
+                probs.append(100.0 * float((arr >= target_dollars).mean()))
+            if ys:
+                ax_i.plot(ys, probs, marker=".", label=name)
+                plotted_any = True
+        ax_i.axvline(target_year, color="red", linestyle=":", alpha=0.5,
+                     label=f"target year ({target_year}y)")
+        ax_i.set_ylabel(f"P(≥ {t_M:.1f}M) %")
+        ax_i.set_ylim(0, 100)
+        ax_i.grid(alpha=0.3)
+        ax_i.legend(loc="lower right", fontsize=8)
+    axes[-1].set_xlabel("Year")
+    if plotted_any:
+        st.pyplot(fig, clear_figure=True)
+        st.caption(
+            f"Each subplot: fraction of historical paths whose {mode} wealth "
+            "at each year reached or exceeded the target. Vertical dotted "
+            "line marks the target year from the sidebar."
+        )
 
     # --- Wealth distribution histogram at a chosen checkpoint ---
     # Default the year to the target year from Goals & Targets (or nearest
@@ -1279,7 +1317,7 @@ if "results" in st.session_state:
     )
     if strategy_to_fan:
         ys, p10s, p50s, p90s = [], [], [], []
-        for y in res["checkpoints"]:
+        for y in sorted(res["per_cp"].get(strategy_to_fan, {}).keys()):
             ps = get_pct(strategy_to_fan, y)
             if ps:
                 ys.append(y)
@@ -1289,7 +1327,7 @@ if "results" in st.session_state:
         if ys:
             fig, ax = plt.subplots(figsize=(8, 4))
             ax.fill_between(ys, p10s, p90s, alpha=0.2, label="p10–p90")
-            ax.plot(ys, p50s, marker="o", color="C0", label="p50")
+            ax.plot(ys, p50s, marker=".", color="C0", label="p50")
             ax.plot(ys, p10s, linestyle="--", color="C0", alpha=0.7, label="p10")
             ax.plot(ys, p90s, linestyle="--", color="C0", alpha=0.7, label="p90")
             ax.set_xlabel("Years")
@@ -1377,7 +1415,7 @@ if "results" in st.session_state:
         if name == "unlev":
             continue
         ys_lev, vals_pre, vals_post = [], [], []
-        for y in res["checkpoints"]:
+        for y in sorted(lev_summary.get(name, {}).keys()):
             d = lev_summary.get(name, {}).get(y)
             if d:
                 ys_lev.append(y)
@@ -1385,7 +1423,7 @@ if "results" in st.session_state:
                 vals_post.append(d.get("p50_post", d["p50"]))
         if not ys_lev:
             continue
-        line, = ax.plot(ys_lev, vals_pre, marker="o", label=name)
+        line, = ax.plot(ys_lev, vals_pre, marker=".", label=name)
         if name in RECAL_KINDS:
             color = line.get_color()
             for y, vp, vq in zip(ys_lev, vals_pre, vals_post):
