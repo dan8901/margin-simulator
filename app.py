@@ -1200,17 +1200,29 @@ if "results" in st.session_state:
     targets_label = ", ".join(f"${t:.1f}M" for t in target_wealths_M)
     st.subheader(f"Probability of reaching ≥ {targets_label} by year N")
 
-    n_targets = len(target_wealths_M)
-    fig, axes = plt.subplots(n_targets, 1, figsize=(8, 3 * n_targets),
-                              sharex=True, squeeze=False)
-    axes = axes[:, 0]
+    # Pick up to 2 strategies (color); each renders one line per target
+    # (linestyle). Total <= 2 × N_targets lines on a single chart.
+    _default_prob_strats = strategy_names[:2]
+    prob_strats = st.multiselect(
+        "Strategies on chart (max 2)",
+        options=strategy_names,
+        default=_default_prob_strats,
+        max_selections=2,
+        key="prob_strats",
+    )
+
+    LINESTYLES = ["-", "--", ":", "-."]   # cycles for >4 targets
+    COLORS = ["C0", "C1", "C2", "C3", "C4", "C5"]
+    # Wider figure to make room for outside-right legends
+    fig, ax = plt.subplots(figsize=(9.5, 4.5))
     plotted_any = False
-    for ax_i, t_M in zip(axes, target_wealths_M):
-        target_dollars = float(t_M) * 1e6
-        for name in strategy_names:
-            cp_dict = res["per_cp"].get(name, {})
+    for s_idx, name in enumerate(prob_strats):
+        cp_dict = res["per_cp"].get(name, {})
+        years_sorted = sorted(cp_dict.keys())
+        for t_idx, t_M in enumerate(target_wealths_M):
+            target_dollars = float(t_M) * 1e6
             ys, probs = [], []
-            for y in sorted(cp_dict.keys()):
+            for y in years_sorted:
                 cp = cp_dict[y]
                 if cp is None or len(cp[mode]) == 0:
                     continue
@@ -1218,21 +1230,53 @@ if "results" in st.session_state:
                 ys.append(y)
                 probs.append(100.0 * float((arr >= target_dollars).mean()))
             if ys:
-                ax_i.plot(ys, probs, marker=".", label=name)
+                ax.plot(ys, probs,
+                        color=COLORS[s_idx % len(COLORS)],
+                        linestyle=LINESTYLES[t_idx % len(LINESTYLES)],
+                        linewidth=1.6)
                 plotted_any = True
-        ax_i.axvline(target_year, color="red", linestyle=":", alpha=0.5,
-                     label=f"target year ({target_year}y)")
-        ax_i.set_ylabel(f"P(≥ {t_M:.1f}M) %")
-        ax_i.set_ylim(0, 100)
-        ax_i.grid(alpha=0.3)
-        ax_i.legend(loc="lower right", fontsize=8)
-    axes[-1].set_xlabel("Year")
     if plotted_any:
+        # Translucent vertical band + small label for target year (visually
+        # distinct from the dotted target-wealth line style).
+        ax.axvspan(target_year - 0.18, target_year + 0.18,
+                   color="red", alpha=0.18, zorder=0)
+        ax.annotate(
+            f"target year ({target_year})",
+            xy=(target_year, 100), xytext=(target_year, 103),
+            fontsize=8, color="firebrick", ha="center", va="bottom",
+            annotation_clip=False,
+        )
+        ax.set_xlabel("Year")
+        ax.set_ylabel("P(wealth ≥ target) (%)")
+        ax.set_ylim(0, 100)
+        ax.grid(alpha=0.3)
+
+        # Two-axis legend OUTSIDE the plot area to keep the data clean.
+        from matplotlib.lines import Line2D
+        strat_handles = [
+            Line2D([0], [0], color=COLORS[i % len(COLORS)],
+                   label=name, linewidth=2)
+            for i, name in enumerate(prob_strats)
+        ]
+        target_handles = [
+            Line2D([0], [0], color="black",
+                   linestyle=LINESTYLES[i % len(LINESTYLES)],
+                   label=f"≥ ${t:.1f}M")
+            for i, t in enumerate(target_wealths_M)
+        ]
+        leg1 = ax.legend(handles=strat_handles, loc="upper left",
+                          bbox_to_anchor=(1.02, 1.0), borderaxespad=0,
+                          title="strategy", fontsize=9, frameon=False)
+        ax.add_artist(leg1)
+        ax.legend(handles=target_handles, loc="upper left",
+                  bbox_to_anchor=(1.02, 0.6), borderaxespad=0,
+                  title="target", fontsize=9, frameon=False)
+        fig.tight_layout()
         st.pyplot(fig, clear_figure=True)
         st.caption(
-            f"Each subplot: fraction of historical paths whose {mode} wealth "
-            "at each year reached or exceeded the target. Vertical dotted "
-            "line marks the target year from the sidebar."
+            f"Single chart: color = strategy, linestyle = target. {mode} "
+            "wealth fraction at each year reaching or exceeding the target. "
+            "Vertical red dotted line marks the target year from the sidebar."
         )
 
     # --- Wealth distribution histogram at a chosen checkpoint ---
