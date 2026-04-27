@@ -1232,11 +1232,25 @@ if run or "results" not in st.session_state:
             cap_enabled=cap_enabled,
             cap_wealth_M=cap_wealth_M,
             checkpoints=checkpoints,
+            paths=paths,
+            paths_key=paths_key,
             params=dict(C=C, S=S, T=T, S2=S2,
-                        max_years=max_years, n_bootstrap=n_bootstrap,
-                        boot_target_pct=boot_target_pct, block_years=block_years,
-                        stretch_F=stretch_F, dd_F=dd_F, wealth_X_M=wealth_X_M,
-                        broker_bump_years=int(broker_bump_years)),
+                        max_years=max_years, max_days=max_days,
+                        n_bootstrap=n_bootstrap, block_years=block_years,
+                        boot_target_pct=boot_target_pct,
+                        stretch_F=stretch_F, dd_F=dd_F,
+                        wealth_X_M=wealth_X_M, wealth_X=wealth_X_val,
+                        vol_factor=float(vol_factor),
+                        dip_threshold=dip_threshold_val,
+                        dip_bonus=float(dip_bonus),
+                        rate_threshold=rate_threshold_val,
+                        rate_factor=float(rate_factor),
+                        recal_period_months=int(recal_period_months),
+                        wealth_glide_exp=float(wealth_glide_exp),
+                        broker_bump_days=broker_bump_days_val,
+                        broker_bump_years=int(broker_bump_years),
+                        cap_real_for_sweep=(cap_real_val
+                            if isinstance(cap_real_val, float) else float("inf"))),
             elapsed=elapsed,
         )
 
@@ -1639,6 +1653,124 @@ if "results" in st.session_state:
             ax.legend()
             ax.grid(alpha=0.3)
             st.pyplot(fig, clear_figure=True)
+
+    # --- T sweep wealth chart ---
+    st.subheader("Wealth at target year vs. years saving S (T-sweep)")
+    st.caption(
+        "Sweeps savings duration T from 0 to 15. For each T value, the "
+        "strategy is RE-CALIBRATED to its well-defended target (hist 0% + "
+        "boot ≤ target + stretch 0%). Each whisker shows p10–p90 wealth "
+        "across historical paths; the horizontal tick is p50. Reuses the "
+        "strategy selected in the wealth-fan dropdown above. Wealth cap is "
+        "ignored in this chart (cache-key constraint)."
+    )
+
+    col_ts1, col_ts2 = st.columns(2)
+    with col_ts1:
+        ts_target_year = st.selectbox(
+            "Target year",
+            options=res["checkpoints"],
+            index=_nearest_cp_idx(res["checkpoints"], target_year),
+            format_func=lambda x: f"{int(x)}y",
+            key="t_sweep_target_year",
+        )
+    with col_ts2:
+        ts_S_override = st.number_input(
+            "Annual savings (S) for sweep",
+            min_value=0,
+            max_value=2_000_000,
+            value=int(p["S"]),
+            step=10_000,
+            key="t_sweep_S",
+            help="Independent of sidebar S. Changing this requires clicking "
+                 "'Run T sweep' to recompute.",
+        )
+
+    run_sweep = st.button("Run T sweep", key="t_sweep_run")
+
+    if run_sweep:
+        with st.spinner("Running T sweep (1–5 minutes for fresh results; "
+                        "cached for re-renders)..."):
+            sweep_F = (res["calibrated"].get(strategy_to_fan, {})
+                       .get("spec", {}).get("F", p.get("dd_F", 1.5))
+                       if strategy_to_fan != "unlev" else 1.5)
+            sweep = compute_t_sweep(
+                p["C"], int(ts_S_override), p["S2"], p["max_days"],
+                tuple(res["checkpoints"]),
+                strategy_to_fan, float(sweep_F),
+                p["boot_target_pct"] / 100.0,
+                p["stretch_F"], p["dd_F"],
+                p["cap_real_for_sweep"], p["wealth_X"],
+                p["vol_factor"], p["dip_threshold"], p["dip_bonus"],
+                p["rate_threshold"], p["rate_factor"],
+                p["recal_period_months"], p["wealth_glide_exp"],
+                p["broker_bump_days"],
+                res["paths_key"], res["paths"],
+            )
+            st.session_state["t_sweep"] = dict(
+                strategy=strategy_to_fan,
+                S=int(ts_S_override),
+                results=sweep,
+            )
+
+    sweep_state = st.session_state.get("t_sweep")
+    if sweep_state and sweep_state["strategy"] == strategy_to_fan:
+        sweep = sweep_state["results"]
+        S_used = sweep_state["S"]
+        T_vals = sorted(sweep.keys())
+        rows = []
+        for tv in T_vals:
+            cp = sweep[tv]["per_cp"].get(float(ts_target_year))
+            if cp is None:
+                continue
+            arr = cp["real"] if real_dollars else cp["nominal"]
+            if len(arr) == 0:
+                continue
+            p10, p50, p90 = np.percentile(arr, [10, 50, 90])
+            rows.append((tv, p10 / 1e6, p50 / 1e6, p90 / 1e6, len(arr)))
+        if rows:
+            arr_t = np.array([r[0] for r in rows])
+            arr_p10 = np.array([r[1] for r in rows])
+            arr_p50 = np.array([r[2] for r in rows])
+            arr_p90 = np.array([r[3] for r in rows])
+            n_paths = rows[0][4]
+
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            ax.vlines(arr_t, arr_p10, arr_p90, color="C0", linewidth=2,
+                      label="p10–p90")
+            ax.hlines(arr_p50, arr_t - 0.3, arr_t + 0.3, color="C0",
+                      linewidth=2, label="p50")
+            target_M = p["wealth_X"] / 1e6
+            ax.axhline(target_M, linestyle="--", color="red", alpha=0.5,
+                       label=f"target ${target_M:.1f}M")
+            ax.axvline(p["T"], linestyle="--", color="gray", alpha=0.5,
+                       label=f"sidebar T={p['T']:g}y")
+            mode_label_local = "real" if real_dollars else "nominal"
+            ax.set_xlabel("Years saving S (T)")
+            ax.set_ylabel(f"Wealth at year {int(ts_target_year)} "
+                          f"(M USD, {mode_label_local})")
+            ax.set_xticks(list(range(0, 16)))
+            ax.set_title(
+                f"{strategy_to_fan} @ S=${S_used:,}/yr — wealth at year "
+                f"{int(ts_target_year)} vs. years saving S"
+            )
+            ax.legend(loc="best", fontsize=8)
+            ax.grid(alpha=0.3)
+            st.pyplot(fig, clear_figure=True)
+            st.caption(
+                f"n={n_paths} historical paths per whisker. Strategy "
+                f"re-calibrated per T (well-defended). Sidebar T={p['T']:g}y "
+                f"shown as gray dashed line."
+            )
+        else:
+            st.info(f"No sweep data at year {int(ts_target_year)}. Re-run the "
+                    "sweep with a target year ≤ horizon.")
+    elif sweep_state and sweep_state["strategy"] != strategy_to_fan:
+        st.info(
+            f"T-sweep cached for '{sweep_state['strategy']}', but you've "
+            f"selected '{strategy_to_fan}' in the fan dropdown above. "
+            "Click 'Run T sweep' to compute for the new strategy."
+        )
 
     # --- Worst-path inspector ---
     st.subheader("Worst historical path at a chosen horizon")
