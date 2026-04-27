@@ -24,3 +24,9 @@ __pycache__/
 
 # Personal notes (kept local)
 thoughts.txt
+
+# Per-user portfolio state for the Advisor page
+advisor_state.json
+
+# Per-user saved sidebar defaults
+app_defaults.json
