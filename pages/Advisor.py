@@ -436,6 +436,15 @@ with st.expander("State (edit / reset)"):
         height=320,
         key="state_editor",
     )
+    st.download_button(
+        "⬇ Download state JSON (backup)",
+        data=json.dumps(state, indent=2),
+        file_name="advisor_state.json",
+        mime="application/json",
+        help="Saves your current state to your Downloads folder. Useful "
+             "before Streamlit Cloud recycles the container, or as a "
+             "snapshot you can paste back in via the editor.",
+    )
     c1, c2, c3 = st.columns(3)
     if c1.button("Save edits", type="primary"):
         try:
