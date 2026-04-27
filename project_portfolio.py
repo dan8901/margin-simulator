@@ -95,6 +95,12 @@ BOX_BPS = 0.0015
 # option value is uncertain (depends on future realization events). Setting
 # this to 0 is the honest hold-forever assumption.
 BOX_TAX_BENEFIT = 0.00
+# Broker-margin rate spread over 3M Treasury, used during the optional
+# "broker bump" phase at the start of the horizon (models the period
+# before the user has options approval / box-spread setup). No tax benefit
+# since broker margin interest is plain investment-interest expense, not
+# Section 1256.
+BROKER_BPS = 0.0150
 CALL_THRESHOLD = 4.0
 REBAL_DAYS = 21
 PATH_DTYPE = np.float32   # halves memory vs float64; ~7-digit precision is plenty
@@ -272,12 +278,18 @@ def compute_recal_table(ret_c, tsy_c, cpi_c, avail_c, S2, e_grid, h_grid_years,
         if h_days > full_max_days:
             h_days = full_max_days
 
-        # Trim historical paths
+        # Trim historical paths. Permissive eligibility: include any path
+        # with at least 1y of available data (avail-bounded simulation
+        # handles short paths correctly through their `avail`). Pre-fix
+        # this was `avail_h >= h_days`, which silently excluded recent
+        # entries (e.g. 2008-08) from cells whose nominal horizon
+        # exceeded the entry's avail. Cells with h_y > ~17y now correctly
+        # test the 2008-08 stress within its 17.7y avail.
         ret_h = ret_c[:, :h_days + 1]
         tsy_h = tsy_c[:, :h_days + 1]
         cpi_h = cpi_c[:, :h_days + 1]
         avail_h = np.minimum(avail_c, h_days)
-        eligible = avail_h >= h_days
+        eligible = avail_h >= TD
         if not eligible.any():
             continue
         ret_h = ret_h[eligible]
@@ -414,7 +426,7 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
                    recal_period_days, t_recal_table, e_recal_grid,
                    h_recal_grid_days,
                    t_recal_tables_meta, meta_score_tables, meta_strategy_codes,
-                   init_strat_idx, wealth_glide_exp):
+                   init_strat_idx, wealth_glide_exp, broker_bump_days):
     """JIT-compiled per-day, per-path inner loop. Avoids temporary array
     allocations entirely. kind_code: 0=static, 1=relever, 2=dd_decay,
     3=wealth_decay, 4=hybrid, 5=r_hybrid, 6=vol_hybrid, 7=dip_hybrid,
@@ -480,8 +492,11 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
 
             stocks_new = stocks[k] * (1.0 + ret[k, d])
             if is_levered:
-                box_rate = (tsy[k, d] + BOX_BPS) * (1.0 - BOX_TAX_BENEFIT)
-                loan_new = loan[k] * (1.0 + box_rate / TD)
+                if d <= broker_bump_days:
+                    rate = tsy[k, d] + BROKER_BPS
+                else:
+                    rate = (tsy[k, d] + BOX_BPS) * (1.0 - BOX_TAX_BENEFIT)
+                loan_new = loan[k] * (1.0 + rate / TD)
             else:
                 loan_new = loan[k]
 
@@ -1073,7 +1088,8 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
              e_recal_grid=None, h_recal_grid_days=None,
              t_recal_tables_meta=None, meta_score_tables=None,
              meta_strategy_codes=None,
-             init_strat_idx=0, wealth_glide_exp=1.0):
+             init_strat_idx=0, wealth_glide_exp=1.0,
+             broker_bump_days=0):
     """Wrapper around the JIT inner loop. Coerces `kind` string to int and
     sets defaults. Returns (real_eq, called, peak_lev, lev_at_cp).
 
@@ -1136,7 +1152,8 @@ def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                           e_recal_grid, h_recal_grid_days,
                           t_recal_tables_meta, meta_score_tables,
                           meta_strategy_codes,
-                          int(init_strat_idx), float(wealth_glide_exp))
+                          int(init_strat_idx), float(wealth_glide_exp),
+                          int(broker_bump_days))
 
 
 def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
@@ -1147,7 +1164,8 @@ def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
               e_recal_grid=None, h_recal_grid_days=None,
               t_recal_tables_meta=None, meta_score_tables=None,
               meta_strategy_codes=None,
-              init_strat_idx=0, wealth_glide_exp=1.0):
+              init_strat_idx=0, wealth_glide_exp=1.0,
+              broker_bump_days=0):
     _, called, _, _ = simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                             avail=avail, F=F, cap_real=cap_real, wealth_X=wealth_X,
                             vol_factor=vol_factor, dip_threshold=dip_threshold,
@@ -1161,7 +1179,8 @@ def call_rate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
                             meta_score_tables=meta_score_tables,
                             meta_strategy_codes=meta_strategy_codes,
                             init_strat_idx=init_strat_idx,
-                            wealth_glide_exp=wealth_glide_exp)
+                            wealth_glide_exp=wealth_glide_exp,
+                            broker_bump_days=broker_bump_days)
     return float(called.mean())
 
 
@@ -1177,7 +1196,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
                         recal_period_days, t_recal_table, e_recal_grid,
                         h_recal_grid_days,
                         t_recal_tables_meta, meta_score_tables, meta_strategy_codes,
-                        init_strat_idx, wealth_glide_exp):
+                        init_strat_idx, wealth_glide_exp, broker_bump_days):
     """Vectorized over T. Runs all T_inits values simultaneously, sharing the
     same per-path data. Returns `called[K, T_count]` only — skips real_eq,
     peak_lev, and leverage tracking since binary search only needs call counts.
@@ -1226,7 +1245,10 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
             tsy_d = tsy[k, d]
             cpi_d = cpi[k, d]
             cpi_0 = cpi[k, 0]
-            box_rate_term = (tsy_d + BOX_BPS) * (1.0 - BOX_TAX_BENEFIT) / TD
+            if d <= broker_bump_days:
+                rate_term = (tsy_d + BROKER_BPS) / TD
+            else:
+                rate_term = (tsy_d + BOX_BPS) * (1.0 - BOX_TAX_BENEFIT) / TD
 
             for t in range(T_count):
                 if called[k, t]:
@@ -1237,7 +1259,7 @@ def _simulate_core_grid(ret, tsy, cpi, kind_code, T_inits, C, S, T_yrs, S2,
 
                 stocks_new = stocks[k, t] * (1.0 + ret_d)
                 if is_levered:
-                    loan_new = loan[k, t] * (1.0 + box_rate_term)
+                    loan_new = loan[k, t] * (1.0 + rate_term)
                 else:
                     loan_new = loan[k, t]
 
@@ -1780,7 +1802,8 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
                           e_recal_grid=None, h_recal_grid_days=None,
                           t_recal_tables_meta=None, meta_score_tables=None,
                           meta_strategy_codes=None,
-                          init_strat_idx=0, wealth_glide_exp=1.0):
+                          init_strat_idx=0, wealth_glide_exp=1.0,
+                          broker_bump_days=0):
     """Two-pass grid search for largest T_init with call rate ≤ target.
 
     Pass 1: coarse linear grid over [lo, hi] with coarse_n points.
@@ -1833,7 +1856,8 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
                                      t_recal_tables_meta, meta_score_tables,
                                      meta_strategy_codes,
                                      int(init_strat_idx),
-                                     float(wealth_glide_exp))
+                                     float(wealth_glide_exp),
+                                     int(broker_bump_days))
         return called.mean(axis=0)
 
     coarse = np.linspace(lo, hi, coarse_n)

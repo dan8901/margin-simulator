@@ -29,6 +29,8 @@ All scripts are self-contained: they read from `spx_margin_history.csv` (not the
 5e. [Streamlit app + new strategy families](#5e-streamlit-app--new-strategy-families-added-in-fourth-session)
 5f. [Re-calibration strategies + meta_recal](#5f-re-calibration-strategies--meta_recal-added-in-fifth-session)
 5g. [Recal T_init calibration fix](#5g-recal-t_init-calibration-fix-added-in-sixth-session)
+5h. [Early broker-rate bump](#5h-early-broker-rate-bump-added-in-seventh-session)
+5i. [Calibration uses avail-bounded all-entries paths](#5i-calibration-uses-avail-bounded-all-entries-paths-added-in-eighth-session)
 6. [Practical recommendations](#6-practical-recommendations)
 7. [Caveats and limitations](#7-caveats-and-limitations)
 8. [Important corrections made during analysis](#8-important-corrections-made-during-analysis)
@@ -313,7 +315,9 @@ These address the overfitting concern: dual-horizon max-safe is the largest targ
 
 - **`analyze_drawdown_decay_persistent.py`** — Tests persistence filter to address COVID-style V-shaped over-reaction: only ratchet max_dd if drawdown persists for DURATION_MIN consecutive months. Sweeps DURATION_MIN ∈ {1, 3, 6, 12} × F ∈ {1.0, 1.5, 2.0}. **Empirical result: persistence filter is a Pareto LOSS.** At every F level, the no-filter (1mo) version has the lowest bootstrap call rate. Longer durations gain 10-30 bps p50 IRR but cost 100-200 bps bootstrap fragility — about a 6:1 bad trade. Mechanism: filter delays max_dd updates during long drawdowns (e.g., 2000-09), so the strategy commits to high leverage during the dangerous early phase before deleveraging. The original instant-ratchet is the safety feature, not a flaw. Negative result; persistence filter abandoned. Tuning F alone gives equivalent IRR-vs-safety trade-offs without adding a parameter.
 
-- **`analyze_drawdown_decay_windowed.py`** — Tests time-windowed max_dd: instead of lifetime ratchet, use max over rolling N-year window so old drawdowns "expire." Sweeps WINDOW ∈ {2y, 5y, 10y, 20y, ∞} × F ∈ {1.0, 1.5, 2.0}. **Empirical results:** (1) 20y window is operationally equivalent to ∞ (differences <10 bps) — long windows catch all material drawdowns in our 30y horizon. (2) Short windows (2y) are dangerous — 10-12% bootstrap calls. (3) The windowed Pareto frontier is *worse* than F-tuning frontier — at fixed F, going from ∞ to 10y trades 16 bps IRR for 110 bps fragility (1:7 against), while going F=1.5→1.0 at ∞ trades 12 bps IRR for 38 bps (1:3). F-tuning is 2-3× more IRR-per-safety-efficient. (4) However, **20y window is a free behavioral substitute for ∞** — same IRR and safety, but provides the property that a 1980 drawdown won't permanently affect your 2030 strategy. Recommendation: use F=1.0–2.0 with either ∞ or 20y window; never go below 10y.
+- **`analyze_drawdown_decay_windowed.py`** — Tests time-windowed max_dd at HISTORICAL-max-safe sizing. Short windows have higher IRR but higher bootstrap fragility. Suggests window-tuning is worse than F-tuning. **THIS CONCLUSION WAS WRONG** — see windowed_welldefended below. The historical-max-safe view doesn't normalize for safety; the well-defended view (same boot threshold) gives the corrected picture.
+
+- **`analyze_drawdown_decay_windowed_welldefended.py`** — Same as windowed but sizes each (F, window) at well-defended target (boot ≤1% + cap=3.0x). **CORRECTED RESULT: short windows (5y) BEAT ∞ window by 15-25 bps p50 IRR at the same safety bar.** F=1.5/5y at T=1.431x: p50 IRR 12.26% @ 1.00% boot. F=1.5/∞ at T=1.461x: p50 IRR 12.06% @ 0.98% boot. **Mechanism**: short window accepts lower T_initial but re-claims leverage as old drawdowns expire from the window. Lifetime ratchet (∞) front-loads leverage and permanently de-levers after each crisis; rolling window deleverages temporarily then recovers. End-leverage confirms (5y: 1.20-1.26x; ∞: 1.05-1.09x). **5y window with F=1.5 is the new recommended Tier 2.**
 
 ---
 
@@ -571,7 +575,7 @@ The user raised a deeper critique than parameter overfitting: **the architecture
 - **0.85-0.90× haircut on historical max-safe** is a reasonable practical buffer that covers all three failure modes (broker tightens, fat tails, path overfitting).
 - **Shared/global state beats per-cohort state for hold-forever leverage.** The cohort-vintage framework (each DCA contribution gets its own max_dd ratchet) was empirically WORSE on bootstrap: 5-6% calls vs 2-4% for single-account drawdown-decay at similar IRR. Reason: post-crisis cohorts start with max_dd=0 and re-lever aggressively during recovery; the next crisis catches them unprotected ("fresh meat" problem). Single-account permanent-learning across all dollars is structurally safer.
 - **Instant ratchet beats smoothed/delayed ratchet.** The persistence filter (only ratchet max_dd if drawdown lasts ≥ N months) was a Pareto loss — adding it gained 10-30 bps p50 IRR but cost 100-200 bps bootstrap fragility, about 6:1 against. Mechanism: delayed updates commit to high leverage during the dangerous early months of a long drawdown. The instant-ratchet appears to be over-reactive on V-shaped events but is the actual safety feature on the multi-year drawdowns that bind max-safe sizing.
-- **F-tuning beats window-tuning on the Pareto frontier** (both for IRR/safety trade-off). Lifetime ratchet (∞) and 20y window are operationally equivalent in our 30y horizon — both work; shorter windows pay safety cost without proportional IRR gain. The windowed approach offers a behavioral property (target eventually re-rises after long recovery) that F-tuning doesn't, but the IRR/fragility trade-off is 2-3× worse than F-tuning. **Use 20y window as a free behavioral substitute for ∞ if you dislike permanent state, but get IRR/safety positioning from F.**
+- **At the same safety bar (well-defended), 5y rolling window BEATS ∞ window on IRR by 15-25 bps p50.** Earlier conclusion that "F-tuning beats window-tuning" was based on historical-max-safe sizing and was misleading because that framing doesn't normalize for safety. At well-defended sizing (boot ≤1% + cap=3.0x), short windows accept lower T_initial but re-claim leverage after window expires; the lifetime ratchet (∞) front-loads leverage and permanently de-levers after each crisis. End-leverage confirms: 5y window ends at 1.20-1.26x while ∞ ends at 1.05-1.09x. The "recover and continue" pattern accumulates more total leveraged exposure over 30 years than "front-load and decay." **Use 5y window with F=1.0-2.0 for Tier 2 active strategy.**
 - **The bootstrap reliably catches false sophistication.** Three "more sophisticated" mechanisms tested in third session (cohorts, persistence filter, short rolling windows) all looked promising on architectural grounds but Pareto-lost vs the simple version. In each case the historical-only data was at-best-neutral on the addition; bootstrap is what showed it was actually harmful. **For any future architectural variant proposal, run bootstrap before believing it.**
 - **For V-shaped (COVID-style) over-reaction concerns, lower F is the right knob.** F=1.0 is the practical calibration for forward-going investors worried about brief shocks; F=2.0+ for those willing to over-react to insure against multi-year crashes. Don't add complexity (persistence filter, rolling window) — the parameter sweep on F alone covers the relevant trade-off space.
 
@@ -1120,6 +1124,206 @@ as a regression test for any future changes to the calibration logic.
   situation (multiple uncommitted changes from a prior session getting
   swept into a focused commit). Soft-reset, split into logical units,
   re-commit. Don't bundle unrelated work into a misnamed commit.
+
+---
+
+## 5h. Early broker-rate bump (added in seventh session)
+
+Models the operational reality that box-spread financing (Tsy + 15 bps,
+the project's default) requires options-trading approval and operational
+setup that typically isn't in place on day 0. Most retail investors will
+spend the first months-to-years on plain broker margin (Tsy + 150 bps,
+no Section 1256 tax benefit) before the box infrastructure is live.
+
+### Mechanism
+
+- New constant `BROKER_BPS = 0.0150` in `project_portfolio.py`.
+- New parameter `broker_bump_days` (int, default 0) threaded through
+  `_simulate_core`, `_simulate_core_grid`, `simulate`, `call_rate`, and
+  `find_max_safe_T_grid`. When `d <= broker_bump_days` the daily loan
+  growth uses `tsy + BROKER_BPS` (no tax benefit); otherwise the existing
+  `(tsy + BOX_BPS) * (1 - BOX_TAX_BENEFIT)` rule.
+- `compute_recal_table` / `compute_recal_tables_multi` deliberately do
+  NOT take the parameter — their internal sub-simulations always run with
+  the default 0. This is correct: each cell represents "from year-X
+  forward with H_remaining left," which in real time corresponds to year
+  5+ where the bump is already over. Applying the bump inside the cell
+  calibration would double-count it.
+- New sidebar slider in `app.py` ("Financing" expander, "Broker-rate
+  years (Tsy+150 bps)", 0–5y, default 2) wires through `compute()` as a
+  cache key and lands in `overlay_kw` for every top-level call. The
+  meta_recal year-0 score sim correctly inherits the bump (it represents
+  years 0..recal_period, the actual early phase).
+
+### Empirical impact (user's primary scenario, hybrid, F=1.5, stretch=1.1, boot=1%)
+
+| bump | T_rec (T_h, T_b, T_s) | p50 @ 30y | vs unlev |
+|---|---|---|---|
+| 0y (idealized) | 1.661x (1.959, 1.661, 1.826) | $12.52M | +32.2% |
+| 2y (default) | 1.661x (1.942, 1.661, 1.810) | $12.46M | +31.7% |
+| 5y (no box ever) | 1.661x (1.942, 1.661, 1.793) | $12.38M | +30.8% |
+
+Same scenario, plain static (T_rec ≈ 2.025x): bump=0y → $10.67M, bump=2y
+→ $10.66M, bump=5y → $10.66M (essentially flat).
+
+### Key findings
+
+1. **T_rec barely shifts under the bump** because the binding constraint
+   (bootstrap fragility from 2000-09–style multi-year drawdowns) doesn't
+   fire in years 0–2 / 0–5. Only T_h and T_s drift down ~15 bps with bump
+   = 2y; T_b (binding for hybrid) is unchanged. Static's T_rec is
+   completely unchanged at 3 decimal places.
+2. **Cost of a 2-year bump ≈ 0.5% of median terminal real wealth**
+   (~$60K on a $12.5M projection). 5y ≈ 1.1%. The cost compounds
+   linearly in bump-years to first order — modest per year because the
+   135 bps differential applies only to the loan principal, which is
+   small relative to the equity stack at year 0 and even smaller after
+   DCA dilution.
+3. **Leverage is comfortably worth it even at broker rates.** Hybrid
+   bump=5y still beats unlev by +30.8%. The "should I wait for box-spread
+   approval before levering?" question has a clean answer: no — the
+   option-value of starting compounding sooner dominates.
+4. **The dominant cost of waiting for box is opportunity cost, not
+   interest cost.** A 2-year delay in initiating leverage costs more
+   than 2 years of paying broker rate, because the early years are when
+   DCA-driven leverage dilution is fastest — every month un-levered in
+   the heavy-DCA window is a month where unlevered DCA dollars are
+   stacking up that you can't lever up later.
+
+### Practical guidance update
+
+Tier 1 / Tier 2 recommendations in §6 are unchanged. The only addition:
+**don't delay starting leverage to wait for box-spread setup.** Start
+on broker margin from day 0; switch to box once the operational pieces
+(options approval, mechanics) are in place. The cost of waiting >>
+the cost of paying broker rate during the transition.
+
+### Note for future sessions
+
+- The bump is a top-level UI parameter, NOT a default in
+  `project_portfolio.py`'s CLI. CLI users still get bump=0 unless they
+  pass `broker_bump_days` explicitly. CLI args could be added if/when
+  needed — currently this is a Streamlit-only UX feature.
+- `verify_recal_tinit.py` and `verify_recal_end_to_end.py` continue to
+  pass without modification (they don't pass `broker_bump_days`, so they
+  exercise the default 0 path — exactly the regression test we want).
+- If the user ever asks "what if my broker rate is different from
+  Tsy+150" — currently this is a hardcoded constant. Refactoring to a
+  parameter (settable from the UI) is straightforward but un-done.
+- The bump only fires for `d <= broker_bump_days`. Day 0 is a degenerate
+  case (no compounding happens on d=0 anyway since the inner loop starts
+  at d=1), so the boundary is consistent.
+
+---
+
+## 5i. Calibration uses avail-bounded all-entries paths (added in eighth session)
+
+Fix to a horizon-sensitivity artifact in the Streamlit calibration. User
+observed that lowering the horizon slider from 30y to 15y *lowered* T_rec
+for hybrid (and identically for static, dd_decay) — counterintuitive.
+
+### Diagnosis
+
+`app.py` builds two historical path sets:
+- `ret_c` = `build_historical_paths(..., min_days=max_days)` — only
+  entries with the FULL nominal horizon of forward data
+- `ret_h` = `build_historical_paths(..., min_days=TD)` — all post-1932
+  entries, with each path's available-day count tracked in `avail_h`
+
+Pre-fix, the historical (T_hist) and stretched-historical (T_stress)
+safety bars used `ret_c`. So at 30y horizon, only entries from
+1932-07 → 1996-04 (~763 paths) were eligible — entries from 1996-04
+onward were silently excluded because they don't yet have 30 years of
+forward data. At 15y horizon, entries from 1932-07 → 2011-04 (~943
+paths) were eligible, including 2008-08 entries that hit the GFC in
+months 0–7.
+
+Result: the 15y "max-safe" stress bar caught the 2008-08 stress
+(stretched ~55% drawdown ≈ binding leverage in year 1) at T = 1.942x.
+The 30y bar didn't see 2008-08 at all and reported T = 2.025x. The
+30y number wasn't "less conservative because longer horizon" — it was
+artificially over-confident because it couldn't test recent stresses.
+
+### Fix
+
+`app.py compute()` switched the historical and stretch
+`find_max_safe_T_grid` calls to use `ret_h, tsy_h, cpi_h, avail_h`
+(plus `ret_s = stretch_returns(ret_h, stretch_F)`). The simulate
+engine already supported per-path availability via `if d > avail[k]:
+continue` in `_simulate_core` line 484 — paths are simulated only
+through their available days, then masked. Capability was already
+there; calibration just wasn't using it.
+
+Bootstrap (T_boot) is unchanged — it generates synthetic horizon-length
+paths and was never affected by this issue.
+
+The terminal-wealth distributions (per-strategy percentile tables, fan
+charts) continue to use `ret_h` for projection (already did, at
+`app.py:603`+ display loop), so those numbers don't change either —
+this fix only affects the calibration leg.
+
+`ret_c` is still kept and used for two specific purposes that need
+full-avail entries for fair comparison:
+- meta_recal score computation (`app.py compute()` ~line 631) — p50
+  real terminal wealth at the next recal event, fair across candidates
+- recal lookup table builders (`compute_recal_table`,
+  `compute_recal_tables_multi`) — cell scoring uses
+  `eligible = avail_h >= h_days` filtering
+
+### Empirical impact (user's primary scenario)
+
+`C=160k, S=180k×5y, S2=30k, X=$3M, F=1.5, stretch=1.1, boot_target=1%, broker_bump=2y`:
+
+| Horizon | hybrid pre | hybrid post | binding (pre) | binding (post) |
+|---|---|---|---|---|
+| 30y | 2.025x | 1.942x | 1937-07 stretch | 2008-08 stretch |
+| 20y | 2.025x | 1.942x | 1937-07 stretch | 2008-08 stretch |
+| 15y | 1.942x | 1.942x | 2008-08 stretch | 2008-08 stretch |
+| 10y | 1.942x | 1.942x | 2008-08 stretch | 2008-08 stretch |
+
+Static and dd_decay also collapse to 1.942x at every horizon. They have
+identical T_rec because the binding event (2008-08) hits in the first
+year — before any deleveraging mechanism diverges from static behavior
+(dd_decay's ratchet hasn't fired, wealth glide barely moved from C).
+
+The fix DROPPED the published 30y T_rec from 2.025x → 1.942x for the
+user's primary scenario. This is the honest answer; the prior 2.025x
+was over-confident.
+
+### Caveats / nuance
+
+1. **Asymmetric inclusion.** Avail-bounded entries can only LOWER T_rec,
+   never raise it: a recent entry with 6y of avail can fail in those 6y
+   (binding the bar), but if it survives those 6y we don't know whether
+   it would survive years 7–30. So this fix is one-way conservative for
+   recent entries. Acceptable trade.
+2. **No min_days floor needed.** Considered a `min_days = max_days // 6`
+   floor (5y at 30y, 2.5y at 15y) to keep too-recent entries from
+   contributing single-year noise. Decided against — short-avail paths
+   that don't bind don't hurt anything; the avail mechanism handles it
+   correctly.
+3. **Strategy convergence at user's scenario is real, not a bug.**
+   Hybrid/static/dd_decay all show T_rec = 1.942x because the binding
+   event is too early for them to differ. Differentiation would appear
+   in low-DCA scenarios where wealth_X / dd_decay ratchet have time to
+   act before the binding event.
+4. **`verify_recal_tinit.py` and `verify_recal_end_to_end.py` still pass
+   without modification** because they call `find_max_safe_T_grid`
+   directly with `ret_c`-style paths (`min_days=max_days`). They check a
+   different invariant (recal == base T) which is unaffected. If you
+   ever want to verify the post-fix calibration matches the streamlit
+   output, the verify scripts would need to be updated to use `min_days=TD`
+   like the app does.
+5. **What you'd need to undo this:** revert four `ret_h → ret_c` swaps
+   in `app.py compute()` and the `stretch_returns(ret_h, ...)` line.
+   Plus the docstring on those few lines.
+
+### Standing rule
+
+The historical / stretch safety bars should always test every post-1932
+entry that has any forward data, with simulation bounded by per-path
+avail. T_rec is a property of "what the data could falsify" — not "what
+the data with 30y of forward data could falsify."
 
 ---
 
