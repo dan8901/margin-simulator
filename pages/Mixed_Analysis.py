@@ -66,23 +66,44 @@ def build_paths(max_days, n_boot, block_days, seed):
     return ret_h, tsy_h, cpi_h, avail_h, ret_b, tsy_b, cpi_b, avail_b
 
 
+@st.cache_resource(show_spinner=False)
+def get_stretched(max_days, n_boot, block_days, seed, stretch_F):
+    """Stretched-historical returns for the drawdown-stress safety bar.
+    Cached separately from the underlying paths so that changing stretch_F
+    doesn't invalidate the (slow-to-build) bootstrap cache."""
+    if stretch_F <= 1.0:
+        return None
+    paths = build_paths(max_days, n_boot, block_days, seed)
+    ret_h = paths[0]
+    return stretch_returns(ret_h, stretch_F)
+
+
 @st.cache_data(show_spinner=False, max_entries=8)
 def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
-              n_boot, block_days, seed, broker_bump_days, alloc_strings):
+              n_boot, block_days, seed, broker_bump_days, stretch_F,
+              alloc_strings):
     """Run the 3-way sweep; returns a list of dicts (one per allocation)."""
     max_days = horizon_yr * TD
     paths = build_paths(max_days, n_boot, block_days, seed)
     ret_h, tsy_h, cpi_h, avail_h, ret_b, tsy_b, cpi_b, avail_b = paths
+    ret_s = get_stretched(max_days, n_boot, block_days, seed, stretch_F)
     h_days = horizon_yr * TD
 
-    # Standalone hybrid reference T (for context display)
+    # Standalone hybrid reference T (for context display) — full 3-bar
+    # well-defended like the main app: hist 0% + boot ≤ target + stretch 0%
     T_h_hist_solo = find_max_safe_T_grid(ret_h, tsy_h, cpi_h, "hybrid", 0.0,
                                           C, S, T_yrs, S2, max_days, avail=avail_h,
                                           F=F, wealth_X=wealth_X)
     T_h_boot_solo = find_max_safe_T_grid(ret_b, tsy_b, cpi_b, "hybrid", boot_target,
                                           C, S, T_yrs, S2, max_days, F=F,
                                           wealth_X=wealth_X)
-    T_solo_hybrid = float(min(T_h_hist_solo, T_h_boot_solo))
+    if ret_s is not None:
+        T_h_stress_solo = find_max_safe_T_grid(ret_s, tsy_h, cpi_h, "hybrid", 0.0,
+                                                C, S, T_yrs, S2, max_days,
+                                                avail=avail_h, F=F, wealth_X=wealth_X)
+    else:
+        T_h_stress_solo = float("inf")
+    T_solo_hybrid = float(min(T_h_hist_solo, T_h_boot_solo, T_h_stress_solo))
 
     results = []
     for s in alloc_strings:
@@ -98,10 +119,16 @@ def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
             T_h = find_safe_T_3way(
                 ret_h, tsy_h, cpi_h, h, ss, u, C, S, T_yrs, S2, max_days,
                 avail_h, F, 1.0, wealth_X, broker_bump_days, 0.0)
-            T = float(min(T_b, T_h))
+            if ret_s is not None:
+                T_st = find_safe_T_3way(
+                    ret_s, tsy_h, cpi_h, h, ss, u, C, S, T_yrs, S2, max_days,
+                    avail_h, F, 1.0, wealth_X, broker_bump_days, 0.0)
+            else:
+                T_st = float("inf")
+            T = float(min(T_b, T_h, T_st))
         else:
             T = 1.0
-            T_b = T_h = 1.0
+            T_b = T_h = T_st = 1.0
 
         # Project hist + boot
         re_h, called_h, peak_h = simulate_3way(
@@ -143,7 +170,7 @@ def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
 
         results.append(dict(
             label=f"{int(h*100):3d}/{int(ss*100):3d}/{int(u*100):3d}",
-            h=h, s=ss, u=u, T=T, T_b=T_b, T_h=T_h,
+            h=h, s=ss, u=u, T=T, T_b=T_b, T_h=T_h, T_st=T_st,
             peak_lev_p99=pl_p99,
             hist_call=float(called_h[eligible].mean()),
             boot_call=float(called_b.mean()),
@@ -203,12 +230,20 @@ day's contribution to underweight sleeves proportionally to their
 deficit-vs-target. If all sleeves are at-or-above target, route at
 target proportions.
 
-**Calibration**: for each allocation with hybrid % > 0, we binary-search
-T_init for the hybrid sleeve such that the bootstrap call rate at the
-combined-collateral level is ≤ target (default 1%). Hybrid sleeves can
-typically run at HIGHER T_init in a mixed account because the SSO/UPRO
-sleeves provide additional collateral support — the simulator captures
-this, including the dynamic decay of that support during drawdowns.
+**Calibration** (well-defended, 3 safety bars — same convention as the
+main app):
+- **T_hist**: largest T with 0% calls on all post-1932 historical entries
+  (avail-bounded — recent entries with <30y forward data still tested
+  through their available window).
+- **T_boot**: largest T with ≤ target call rate on synthetic bootstrap paths.
+- **T_stress**: largest T with 0% calls on stretched-historical paths
+  (each post-1932 drawdown amplified by stretch_F, e.g. 50% → 55% at F=1.1).
+- **T_rec = min(T_hist, T_boot, T_stress)**.
+
+Hybrid sleeves typically run at HIGHER T_init in a mixed account because
+the SSO/UPRO sleeves provide additional collateral support — the
+simulator captures this dynamically (collateral shrinks faster than SPX
+during drawdowns since SSO/UPRO are 2x/3x the move).
 
 **Conservative wipeout**: when a margin call fires, the path is treated
 as fully wiped (real_eq = 0). In real-world partial-liquidation behavior
@@ -253,6 +288,14 @@ with col_d:
     block_yrs = st.number_input("Bootstrap block (years)", value=1.0,
                                  step=0.5, key="mix_block_yrs")
     seed = st.number_input("RNG seed", value=42, step=1, key="mix_seed")
+stretch_F = st.number_input(
+    "Drawdown stretch factor (1.0 = no stretch; 1.1 default)",
+    value=1.1, step=0.1, min_value=1.0, max_value=2.0,
+    key="mix_stretch_F",
+    help="Third safety bar: amplifies post-1932 drawdowns by this factor "
+         "and requires 0% calls on the stretched paths. 1.1 means 'a "
+         "historical 50% drawdown becomes a 55% drawdown.' Same convention "
+         "as the main app's stretch_F. Set to 1.0 to disable.")
 
 st.subheader("Allocations to evaluate (h_hyb, h_sso, h_upro — sum to 100)")
 alloc_text = st.text_area(
@@ -287,7 +330,8 @@ if run_btn or st.session_state.get("mix_results") is not None:
                 int(C), float(S), float(T_yrs), float(S2),
                 float(wealth_X), int(horizon_yr), float(F),
                 float(boot_target), int(n_boot), int(block_days), int(seed),
-                int(broker_bump_days), tuple(alloc_strings))
+                int(broker_bump_days), float(stretch_F),
+                tuple(alloc_strings))
             elapsed = time.time() - t0
 
         st.session_state["mix_results"] = results
@@ -345,9 +389,14 @@ if run_btn or st.session_state.get("mix_results") is not None:
 
     rows = []
     for r in results:
+        T_st_str = (f"{r['T_st']:.2f}x" if r['T_st'] != float("inf")
+                    else "—")
         rows.append(dict(
             alloc=r["label"],
             T_hyb=f"{r['T']:.3f}x",
+            T_hist=f"{r['T_h']:.2f}x",
+            T_boot=f"{r['T_b']:.2f}x",
+            T_stress=T_st_str,
             pkLv99=f"{r['peak_lev_p99']:.2f}x",
             hist_call=f"{r['hist_call']*100:.2f}%",
             boot_call=f"{r['boot_call']*100:.2f}%",

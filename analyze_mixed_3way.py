@@ -2,8 +2,9 @@
 analyze_mixed_3way.py — comprehensive 3-sleeve analysis: hybrid + SSO + UPRO.
 
 For each allocation (h, s, u) with h+s+u=1:
-  1. Calibrate hybrid sleeve T_init to well-defended (hist 0% + boot ≤1%
-     under combined-collateral margin call check).
+  1. Calibrate hybrid sleeve T_init to well-defended:
+     min(hist 0% calls, boot ≤ 1% calls, stretch 0% calls at F=1.1)
+     under combined-collateral margin call check.
   2. Project on historical paths (variable horizon via avail).
   3. Project on bootstrap paths (full 30y).
   4. Report wealth percentiles + tail metrics.
@@ -30,10 +31,11 @@ import numpy as np
 from data_loader import load
 from project_portfolio import (build_historical_paths, build_bootstrap_paths,
                                 find_max_safe_T_grid, simulate_3way,
-                                find_safe_T_3way, TD)
+                                find_safe_T_3way, stretch_returns, TD)
 
 
 F_DEFAULT = 1.5
+STRETCH_F = 1.1
 BOOT_TARGET = 0.01
 N_BOOT_PATHS = 500
 BLOCK_DAYS = 252
@@ -114,7 +116,9 @@ def main():
     ret_b, tsy_b, cpi_b = build_bootstrap_paths(
         dates, px, tsy, cpi, max_days, N_BOOT_PATHS, BLOCK_DAYS, rng)
     avail_b = np.full(ret_b.shape[0], max_days, dtype=np.int64)
-    print(f"  hist paths: {ret_h.shape[0]}, boot paths: {ret_b.shape[0]}")
+    ret_s = stretch_returns(ret_h, STRETCH_F) if STRETCH_F > 1.0 else None
+    print(f"  hist paths: {ret_h.shape[0]}, boot paths: {ret_b.shape[0]}, "
+          f"stretch_F={STRETCH_F}")
     print()
 
     h_days = HORIZON_YR * TD
@@ -154,7 +158,14 @@ def main():
                     ret_h, tsy_h, cpi_h, h, s, u, scen["C"], scen["S"],
                     scen["T_yrs"], scen["S2"], max_days, avail_h,
                     F_DEFAULT, 1.0, wxt, 0, 0.0)
-                T = float(min(T_b, T_h))
+                if ret_s is not None:
+                    T_st = find_safe_T_3way(
+                        ret_s, tsy_h, cpi_h, h, s, u, scen["C"], scen["S"],
+                        scen["T_yrs"], scen["S2"], max_days, avail_h,
+                        F_DEFAULT, 1.0, wxt, 0, 0.0)
+                else:
+                    T_st = float("inf")
+                T = float(min(T_b, T_h, T_st))
             else:
                 T = 1.0
 
