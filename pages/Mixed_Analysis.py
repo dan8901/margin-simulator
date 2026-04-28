@@ -160,10 +160,10 @@ def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
         if len(v_h) == 0 or len(v_b) == 0:
             continue
 
-        p1h, p5h, p10h, p50h, p90h = [float(x) for x in
-                                       np.percentile(v_h, [1, 5, 10, 50, 90])]
-        p1b, p5b, p10b, p50b, p90b = [float(x) for x in
-                                       np.percentile(v_b, [1, 5, 10, 50, 90])]
+        p1h, p5h, p10h, p25h, p50h, p75h, p90h = [float(x) for x in
+                                       np.percentile(v_h, [1, 5, 10, 25, 50, 75, 90])]
+        p1b, p5b, p10b, p25b, p50b, p75b, p90b = [float(x) for x in
+                                       np.percentile(v_b, [1, 5, 10, 25, 50, 75, 90])]
 
         pl_p99 = (float(np.percentile(peak_h[~called_h], 99))
                   if (~called_h).any() else float("nan"))
@@ -176,8 +176,10 @@ def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
             boot_call=float(called_b.mean()),
             min_b=float(v_b.min()),
             frac_below_C_b=float((v_b < C).mean()),
-            p1_h=p1h, p5_h=p5h, p10_h=p10h, p50_h=p50h, p90_h=p90h,
-            p1_b=p1b, p5_b=p5b, p10_b=p10b, p50_b=p50b, p90_b=p90b,
+            p1_h=p1h, p5_h=p5h, p10_h=p10h, p25_h=p25h, p50_h=p50h,
+            p75_h=p75h, p90_h=p90h,
+            p1_b=p1b, p5_b=p5b, p10_b=p10b, p25_b=p25b, p50_b=p50b,
+            p75_b=p75b, p90_b=p90b,
         ))
 
     return results, T_solo_hybrid
@@ -403,10 +405,14 @@ if run_btn or st.session_state.get("mix_results") is not None:
             min_b=f"${r['min_b']/1e6:.2f}M",
             below_C=f"{r['frac_below_C_b']*100:.1f}%",
             p10_h=f"${r['p10_h']/1e6:.2f}M",
+            p25_h=f"${r['p25_h']/1e6:.2f}M",
             p50_h=f"${r['p50_h']/1e6:.2f}M",
+            p75_h=f"${r['p75_h']/1e6:.2f}M",
             p90_h=f"${r['p90_h']/1e6:.2f}M",
             p10_b=f"${r['p10_b']/1e6:.2f}M",
+            p25_b=f"${r['p25_b']/1e6:.2f}M",
             p50_b=f"${r['p50_b']/1e6:.2f}M",
+            p75_b=f"${r['p75_b']/1e6:.2f}M",
             p90_b=f"${r['p90_b']/1e6:.2f}M",
             pareto="✓" if r["label"] in pareto else "",
         ))
@@ -415,18 +421,17 @@ if run_btn or st.session_state.get("mix_results") is not None:
 
     # Charts
     st.subheader("Wealth distribution by allocation (historical)")
-    chart_df = pd.DataFrame([
-        dict(alloc=r["label"], pct="p10", wealth_M=r["p10_h"] / 1e6)
-        for r in results
-    ] + [
-        dict(alloc=r["label"], pct="p50", wealth_M=r["p50_h"] / 1e6)
-        for r in results
-    ] + [
-        dict(alloc=r["label"], pct="p90", wealth_M=r["p90_h"] / 1e6)
-        for r in results
-    ])
+    chart_rows = []
+    for pct in ("p10", "p25", "p50", "p75", "p90"):
+        for r in results:
+            chart_rows.append(dict(alloc=r["label"], pct=pct,
+                                    wealth_M=r[f"{pct}_h"] / 1e6))
+    chart_df = pd.DataFrame(chart_rows)
     pivot = chart_df.pivot(index="alloc", columns="pct",
-                            values="wealth_M").reindex([r["label"] for r in results])
+                            values="wealth_M").reindex(
+        [r["label"] for r in results])
+    # Order columns left-to-right: p10, p25, p50, p75, p90
+    pivot = pivot[["p10", "p25", "p50", "p75", "p90"]]
     st.bar_chart(pivot, height=400)
 
     st.subheader("Bootstrap tail: min wealth and frac below initial C")
