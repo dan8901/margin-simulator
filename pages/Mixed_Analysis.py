@@ -433,6 +433,8 @@ if run_btn or st.session_state.get("mix_results") is not None:
             boot_call=f"{r['boot_call']*100:.2f}%",
             min_b=f"${r['min_b']/1e6:.2f}M",
             below_C=f"{r['frac_below_C_b']*100:.1f}%",
+            p1_h=f"${r['p1_h']/1e6:.2f}M",
+            p5_h=f"${r['p5_h']/1e6:.2f}M",
             p10_h=f"${r['p10_h']/1e6:.2f}M",
             p25_h=f"${r['p25_h']/1e6:.2f}M",
             p50_h=f"${r['p50_h']/1e6:.2f}M",
