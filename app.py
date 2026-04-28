@@ -1694,35 +1694,42 @@ if "results" in st.session_state:
                    "to repopulate the parameters needed by this chart.")
         run_sweep = False
 
+    def _run_one_sweep(kind):
+        sweep_F = (res["calibrated"].get(kind, {})
+                   .get("spec", {}).get("F", p.get("dd_F", 1.5))
+                   if kind != "unlev" else 1.5)
+        return compute_t_sweep(
+            p["C"], int(ts_S_override), p["S2"], p["max_days"],
+            tuple(res["checkpoints"]),
+            kind, float(sweep_F),
+            p["boot_target_pct"] / 100.0,
+            p["stretch_F"], p["dd_F"],
+            p["cap_real_for_sweep"], p["wealth_X"],
+            p["vol_factor"], p["dip_threshold"], p["dip_bonus"],
+            p["rate_threshold"], p["rate_factor"],
+            p["recal_period_months"], p["wealth_glide_exp"],
+            p["broker_bump_days"],
+            res["paths_key"], res["paths"],
+        )
+
     if run_sweep:
         with st.spinner("Running T sweep (1–5 minutes for fresh results; "
                         "cached for re-renders)..."):
-            sweep_F = (res["calibrated"].get(strategy_to_fan, {})
-                       .get("spec", {}).get("F", p.get("dd_F", 1.5))
-                       if strategy_to_fan != "unlev" else 1.5)
-            sweep = compute_t_sweep(
-                p["C"], int(ts_S_override), p["S2"], p["max_days"],
-                tuple(res["checkpoints"]),
-                strategy_to_fan, float(sweep_F),
-                p["boot_target_pct"] / 100.0,
-                p["stretch_F"], p["dd_F"],
-                p["cap_real_for_sweep"], p["wealth_X"],
-                p["vol_factor"], p["dip_threshold"], p["dip_bonus"],
-                p["rate_threshold"], p["rate_factor"],
-                p["recal_period_months"], p["wealth_glide_exp"],
-                p["broker_bump_days"],
-                res["paths_key"], res["paths"],
-            )
+            sweep = _run_one_sweep(strategy_to_fan)
             st.session_state["t_sweep"] = dict(
                 strategy=strategy_to_fan,
                 S=int(ts_S_override),
                 results=sweep,
             )
+            if strategy_to_fan != "unlev":
+                # Always also compute unlev for the comparison chart below
+                unlev_sweep = _run_one_sweep("unlev")
+                st.session_state["t_sweep_unlev"] = dict(
+                    S=int(ts_S_override),
+                    results=unlev_sweep,
+                )
 
-    sweep_state = st.session_state.get("t_sweep")
-    if sweep_state and sweep_state["strategy"] == strategy_to_fan:
-        sweep = sweep_state["results"]
-        S_used = sweep_state["S"]
+    def _render_whisker_chart(sweep, S_used, kind_label):
         T_vals = sorted(sweep.keys())
         rows = []
         for tv in T_vals:
@@ -1732,45 +1739,61 @@ if "results" in st.session_state:
             arr = cp["real"] if real_dollars else cp["nominal"]
             if len(arr) == 0:
                 continue
-            p10, p50, p90 = np.percentile(arr, [10, 50, 90])
-            rows.append((tv, p10 / 1e6, p50 / 1e6, p90 / 1e6, len(arr)))
-        if rows:
-            arr_t = np.array([r[0] for r in rows])
-            arr_p10 = np.array([r[1] for r in rows])
-            arr_p50 = np.array([r[2] for r in rows])
-            arr_p90 = np.array([r[3] for r in rows])
-            n_paths = rows[0][4]
-
-            fig, ax = plt.subplots(figsize=(8, 4.5))
-            ax.vlines(arr_t, arr_p10, arr_p90, color="C0", linewidth=2,
-                      label="p10–p90")
-            ax.hlines(arr_p50, arr_t - 0.3, arr_t + 0.3, color="C0",
-                      linewidth=2, label="p50")
-            target_M = p["wealth_X"] / 1e6
-            ax.axhline(target_M, linestyle="--", color="red", alpha=0.5,
-                       label=f"target ${target_M:.1f}M")
-            ax.axvline(p["T"], linestyle="--", color="gray", alpha=0.5,
-                       label=f"sidebar T={p['T']:g}y")
-            mode_label_local = "real" if real_dollars else "nominal"
-            ax.set_xlabel("Years saving S (T)")
-            ax.set_ylabel(f"Wealth at year {int(ts_target_year)} "
-                          f"(M USD, {mode_label_local})")
-            ax.set_xticks(list(range(0, 16)))
-            ax.set_title(
-                f"{strategy_to_fan} @ S=${S_used:,}/yr — wealth at year "
-                f"{int(ts_target_year)} vs. years saving S"
-            )
-            ax.legend(loc="best", fontsize=8)
-            ax.grid(alpha=0.3)
-            st.pyplot(fig, clear_figure=True)
-            st.caption(
-                f"n={n_paths} historical paths per whisker. Strategy "
-                f"re-calibrated per T (well-defended). Sidebar T={p['T']:g}y "
-                f"shown as gray dashed line."
-            )
-        else:
+            p10, p25, p50, p75, p90 = np.percentile(arr, [10, 25, 50, 75, 90])
+            rows.append((tv, p10 / 1e6, p25 / 1e6, p50 / 1e6, p75 / 1e6,
+                         p90 / 1e6, len(arr)))
+        if not rows:
             st.info(f"No sweep data at year {int(ts_target_year)}. Re-run the "
                     "sweep with a target year ≤ horizon.")
+            return
+        arr_t = np.array([r[0] for r in rows])
+        arr_p10 = np.array([r[1] for r in rows])
+        arr_p25 = np.array([r[2] for r in rows])
+        arr_p50 = np.array([r[3] for r in rows])
+        arr_p75 = np.array([r[4] for r in rows])
+        arr_p90 = np.array([r[5] for r in rows])
+        n_paths = rows[0][6]
+
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.vlines(arr_t, arr_p10, arr_p90, color="C0", linewidth=2,
+                  label="p10–p90")
+        ax.hlines(arr_p25, arr_t - 0.18, arr_t + 0.18, color="C0",
+                  linewidth=1, alpha=0.6, label="p25 / p75")
+        ax.hlines(arr_p75, arr_t - 0.18, arr_t + 0.18, color="C0",
+                  linewidth=1, alpha=0.6)
+        ax.hlines(arr_p50, arr_t - 0.3, arr_t + 0.3, color="C0",
+                  linewidth=2, label="p50")
+        target_M = p["wealth_X"] / 1e6
+        ax.axhline(target_M, linestyle="--", color="red", alpha=0.5,
+                   label=f"target ${target_M:.1f}M")
+        ax.axvline(p["T"], linestyle="--", color="gray", alpha=0.5,
+                   label=f"sidebar T={p['T']:g}y")
+        mode_label_local = "real" if real_dollars else "nominal"
+        ax.set_xlabel("Years saving S (T)")
+        ax.set_ylabel(f"Wealth at year {int(ts_target_year)} "
+                      f"(M USD, {mode_label_local})")
+        ax.set_xticks(list(range(0, 16)))
+        ax.set_title(
+            f"{kind_label} @ S=${S_used:,}/yr — wealth at year "
+            f"{int(ts_target_year)} vs. years saving S"
+        )
+        ax.legend(loc="best", fontsize=8)
+        ax.grid(alpha=0.3)
+        st.pyplot(fig, clear_figure=True)
+        st.caption(
+            f"n={n_paths} historical paths per whisker. Sidebar "
+            f"T={p['T']:g}y shown as gray dashed line."
+        )
+
+    sweep_state = st.session_state.get("t_sweep")
+    if sweep_state and sweep_state["strategy"] == strategy_to_fan:
+        _render_whisker_chart(sweep_state["results"], sweep_state["S"],
+                              strategy_to_fan)
+        if strategy_to_fan != "unlev":
+            unlev_state = st.session_state.get("t_sweep_unlev")
+            if unlev_state and unlev_state["S"] == sweep_state["S"]:
+                _render_whisker_chart(unlev_state["results"],
+                                      unlev_state["S"], "unlev")
     elif sweep_state and sweep_state["strategy"] != strategy_to_fan:
         st.info(
             f"T-sweep cached for '{sweep_state['strategy']}', but you've "
