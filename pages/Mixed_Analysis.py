@@ -10,6 +10,8 @@ Computation is cached on the scenario tuple — re-running the same scenario
 is fast.
 """
 
+import json
+import os
 import time
 
 import altair as alt
@@ -24,6 +26,36 @@ from project_portfolio import (build_historical_paths, build_bootstrap_paths,
 
 
 st.set_page_config(page_title="Mixed Analysis", layout="wide")
+
+
+# ---------------------------------------------------------------------------
+# Persistable settings: same pattern as the main app.
+# Stored in mixed_defaults.json next to project_portfolio.py.
+# ---------------------------------------------------------------------------
+PERSISTED_KEYS = [
+    "mix_C", "mix_S", "mix_Tyrs", "mix_S2",
+    "mix_wealthX", "mix_horizon", "mix_F", "mix_bump",
+    "mix_boot_target", "mix_n_boot", "mix_block_yrs", "mix_seed",
+    "mix_stretch_F",
+    "mix_alloc_text",
+    "mix_cmp_allocs", "mix_cmp_source", "mix_cmp_log",
+]
+_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULTS_PATH = os.path.join(_PROJECT_DIR, "mixed_defaults.json")
+
+# Pre-populate session_state from saved defaults BEFORE widgets render
+if "_mix_loaded_defaults" not in st.session_state:
+    if os.path.exists(DEFAULTS_PATH):
+        try:
+            with open(DEFAULTS_PATH) as f:
+                _saved = json.load(f)
+            for _k, _v in _saved.items():
+                if _k in PERSISTED_KEYS and _k not in st.session_state:
+                    st.session_state[_k] = _v
+        except Exception:
+            pass
+    st.session_state["_mix_loaded_defaults"] = True
+
 
 # Defaults
 DEFAULT_ALLOCS = [
@@ -236,6 +268,19 @@ def pareto_frontier(results, keys=("p10_h", "p50_h", "p90_h")):
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
+
+with st.sidebar:
+    if st.button("💾 Save current Mixed Analysis settings as default",
+                  use_container_width=True):
+        snapshot = {k: st.session_state[k] for k in PERSISTED_KEYS
+                    if k in st.session_state}
+        try:
+            with open(DEFAULTS_PATH, "w") as f:
+                json.dump(snapshot, f, indent=2, default=str)
+            st.toast(f"Saved {len(snapshot)} settings to mixed_defaults.json",
+                     icon="💾")
+        except Exception as e:
+            st.toast(f"Save failed: {e}", icon="⚠️")
 
 st.title("Mixed Strategy Analysis: Hybrid + SSO + UPRO")
 st.caption("3-sleeve portfolio with shared margin collateral and "
