@@ -39,6 +39,7 @@ PERSISTED_KEYS = [
     "mix_stretch_F",
     "mix_alloc_text",
     "mix_cmp_allocs", "mix_cmp_source", "mix_cmp_log",
+    "mix_prob_targets", "mix_prob_allocs", "mix_prob_source",
 ]
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULTS_PATH = os.path.join(_PROJECT_DIR, "mixed_defaults.json")
@@ -201,10 +202,14 @@ def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
         pl_p99 = (float(np.percentile(peak_h[~called_h], 99))
                   if (~called_h).any() else float("nan"))
 
-        # Per-year percentile bands (variable horizon: shorter years get
-        # more paths via avail filter; year 30 only sees full-horizon paths)
+        # Per-year percentile bands + wealth arrays (variable horizon:
+        # shorter years get more paths via avail filter; year 30 only sees
+        # full-horizon paths). Wealth arrays kept for arbitrary-target
+        # probability queries (no need to recompute the sim).
         pct_by_year_h = {}
         pct_by_year_b = {}
+        wealth_by_year_h = {}
+        wealth_by_year_b = {}
         for y in range(1, horizon_yr + 1):
             d = y * TD
             if d > max_days:
@@ -218,6 +223,7 @@ def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
                     p10=float(pp[0]), p25=float(pp[1]), p50=float(pp[2]),
                     p75=float(pp[3]), p90=float(pp[4]),
                     n=int(len(vh)))
+                wealth_by_year_h[y] = vh.astype(np.float32)
             vb = re_b[:, d]
             vb = vb[~np.isnan(vb)]
             if len(vb) > 0:
@@ -226,6 +232,7 @@ def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
                     p10=float(pp[0]), p25=float(pp[1]), p50=float(pp[2]),
                     p75=float(pp[3]), p90=float(pp[4]),
                     n=int(len(vb)))
+                wealth_by_year_b[y] = vb.astype(np.float32)
 
         results.append(dict(
             label=f"{int(h*100):3d}/{int(ss*100):3d}/{int(u*100):3d}",
@@ -241,6 +248,8 @@ def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
             p75_b=p75b, p90_b=p90b,
             pct_by_year_h=pct_by_year_h,
             pct_by_year_b=pct_by_year_b,
+            wealth_by_year_h=wealth_by_year_h,
+            wealth_by_year_b=wealth_by_year_b,
         ))
 
     return results, T_solo_hybrid
@@ -618,3 +627,92 @@ if run_btn or st.session_state.get("mix_results") is not None:
                             n_paths=p["n"]))
                 st.dataframe(pd.DataFrame(table_rows), hide_index=True,
                              height=400)
+
+    # ------------------------------------------------------------------
+    # Probability of reaching target wealth over time
+    # ------------------------------------------------------------------
+    st.subheader("Probability of reaching target wealth over time")
+    st.caption(
+        "P(real wealth ≥ target) computed empirically per year from the "
+        "per-year wealth arrays (avail-bounded for historical, full-horizon "
+        "for bootstrap). Multiple targets render as separate line styles; "
+        "allocations are color-coded.")
+    colp1, colp2, colp3 = st.columns([3, 2, 1])
+    with colp1:
+        prob_allocs = st.multiselect(
+            "Allocations",
+            options=[r["label"] for r in results],
+            default=st.session_state.get(
+                "mix_prob_allocs",
+                [r["label"] for r in results
+                 if r["label"] in pareto[:3]] or
+                [r["label"] for r in results[:3]]),
+            key="mix_prob_allocs",
+            help="No max — but more lines get visually busy fast.")
+    with colp2:
+        prob_targets_str = st.text_input(
+            "Target wealths ($M, comma-separated)",
+            value=st.session_state.get(
+                "mix_prob_targets",
+                f"{scen.get('wealth_X_M', 3.0):.1f}"
+                if scen.get('wealth_X_M', 0) > 0 else "1, 3, 5"),
+            key="mix_prob_targets",
+            help="e.g. '1, 3, 5' for $1M, $3M, $5M curves.")
+    with colp3:
+        prob_source = st.radio(
+            "Path set", options=["historical", "bootstrap"],
+            index=(0 if st.session_state.get("mix_prob_source",
+                                              "historical") == "historical"
+                   else 1),
+            key="mix_prob_source")
+
+    try:
+        prob_targets = [
+            float(s.strip()) for s in prob_targets_str.split(",")
+            if s.strip()]
+        prob_targets = [t for t in prob_targets if t > 0]
+    except ValueError:
+        prob_targets = []
+
+    if not prob_allocs:
+        st.info("Pick at least one allocation.")
+    elif not prob_targets:
+        st.info("Enter at least one target wealth.")
+    else:
+        wkey = ("wealth_by_year_h" if prob_source == "historical"
+                else "wealth_by_year_b")
+        rows_p = []
+        for r in results:
+            if r["label"] not in prob_allocs:
+                continue
+            by_y = r[wkey]
+            for y in sorted(by_y.keys()):
+                v = by_y[y]
+                n = len(v)
+                if n == 0:
+                    continue
+                for t_M in prob_targets:
+                    tgt = t_M * 1e6
+                    p_reach = float((v >= tgt).mean()) * 100.0
+                    rows_p.append(dict(
+                        alloc=r["label"], year=y, target_M=t_M,
+                        target_label=f"≥ ${t_M:.1f}M",
+                        prob_pct=p_reach, n=n))
+        if not rows_p:
+            st.info("No wealth data for the selected allocations.")
+        else:
+            prob_df = pd.DataFrame(rows_p)
+            prob_chart = alt.Chart(prob_df).mark_line(
+                strokeWidth=2.0).encode(
+                x=alt.X("year:Q", title="Year"),
+                y=alt.Y("prob_pct:Q",
+                        title="P(wealth ≥ target) (%)",
+                        scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("alloc:N", title="Allocation"),
+                strokeDash=alt.StrokeDash(
+                    "target_label:N", title="Target"),
+                tooltip=["alloc:N", "year:Q", "target_label:N",
+                         alt.Tooltip("prob_pct:Q", format=".1f"),
+                         "n:Q"],
+            ).properties(height=400).interactive()
+            st.altair_chart(prob_chart, use_container_width=True)
