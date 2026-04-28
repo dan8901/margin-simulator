@@ -32,6 +32,7 @@ All scripts are self-contained: they read from `spx_margin_history.csv` (not the
 5h. [Early broker-rate bump](#5h-early-broker-rate-bump-added-in-seventh-session)
 5i. [Calibration uses avail-bounded all-entries paths](#5i-calibration-uses-avail-bounded-all-entries-paths-added-in-eighth-session)
 5j. [Daily-leveraged ETFs (SSO/UPRO)](#5j-daily-leveraged-etfs-ssoupro-added-in-ninth-session)
+5k. [3-way mixed strategies (hybrid + SSO + UPRO)](#5k-3-way-mixed-strategies-hybrid--sso--upro-added-in-tenth-session)
 6. [Practical recommendations](#6-practical-recommendations)
 7. [Caveats and limitations](#7-caveats-and-limitations)
 8. [Important corrections made during analysis](#8-important-corrections-made-during-analysis)
@@ -1522,6 +1523,70 @@ user's utility curve (left-tail-averse → hybrid; EV-maximizer → SSO).
 
 ---
 
+## 5k. 3-way mixed strategies (hybrid + SSO + UPRO) (added in tenth session)
+
+User asked for a comprehensive mix analysis: combine hybrid (margin-on-SPX) with SSO (2x daily) and/or UPRO (3x daily) with shared margin collateral and DCA-only rebalancing (no selling).
+
+### Architecture
+
+Three sleeves with target allocation `(h_hyb, h_sso, h_upro)` summing to 1.0:
+- **Hybrid sleeve**: SPX held with margin loan, hybrid-strategy logic (dd_decay ratchet ∧ wealth_decay glide on TOTAL real wealth) applied to its own sleeve equity.
+- **SSO sleeve**: 2x daily-reset.
+- **UPRO sleeve**: 3x daily-reset.
+
+**Combined-collateral margin call check** (Reg-T leveraged-ETF maintenance — SPX 25%, SSO 50%, UPRO 75%):
+```
+loan_h ≤ 0.75·stocks_h + 0.50·stocks_sso + 0.25·stocks_upro
+```
+
+The SSO/UPRO sleeves contribute additional borrowing capacity to the hybrid sleeve. SSO contributes ~2/3 of equivalent SPX collateral; UPRO contributes ~1/3. The simulator captures the *dynamic* erosion of this support during drawdowns (SSO drops 2× faster than SPX, UPRO 3× faster, so collateral shrinks fastest exactly when needed most).
+
+**DCA rule (no selling)**: each contribution day, route the contribution to underweight sleeves proportionally to their deficit-vs-target. If all sleeves at-or-above target, route at target proportions. This is the only honest "rebalancing" mechanism in a hold-forever taxable account.
+
+### Implementation
+
+- **`simulate_3way`** + **`find_safe_T_3way`** in `project_portfolio.py` — JIT-compiled inner loop with the three-sleeve dynamics + binary-search T_init calibration.
+- **`analyze_mixed_3way.py`** — standalone CLI sweep over 16 allocations × 3 scenarios at 30y horizon. Reports T_hyb, peak hybrid leverage, hist/boot call rates, percentiles + tail metrics.
+- **`pages/Mixed_Analysis.py`** — Streamlit page wrapping the sweep. User specifies scenario (C/S/T_yrs/S2/wealth_X/horizon/F/broker_bump), safety bar (boot_target/n_paths/block_yrs/seed), and a free-form list of allocations. Output: best-by-criterion summary, full sweep table with Pareto markers, bar charts of percentiles + tail metrics.
+- **`analyze_mixed_hybrid_sso.py`** + **`analyze_mixed_collateral.py`** — earlier 2-way prototypes preserved for context.
+
+### Key empirical finding (Scenario A, heavy DCA, 30y)
+
+Allocation `(25, 50, 25)` — 25% hybrid + 50% SSO + 25% UPRO — **Pareto-dominates 100% SSO** on every percentile (p10/p50/p90, both historical and bootstrap):
+
+| Allocation | T_hyb | peak lev | p10_h | p50_h | p90_h | p10_b | p50_b | p90_b |
+|---|---|---|---|---|---|---|---|---|
+| 100% SSO | 1.00x | 1.00x | $5.27M | $15.59M | $71.63M | $2.16M | $20.27M | $189M |
+| **25/50/25** | **1.83x** | **4.58x** | **$5.41M** | **$15.83M** | **$111.72M** | **$2.36M** | **$20.42M** | **$282M** |
+
+The hybrid sleeve's small allocation (25%) runs at peak leverage 4.58x (above the standalone 4x cap, possible only because of joint SSO/UPRO collateral). This extra leverage upside more than offsets the SSO/UPRO tilt.
+
+**Caveat**: the conservative wipeout model treats called paths as $0 wealth. 25/50/25 has 1% bootstrap call rate (vs 100% SSO's 0%). In real broker partial-liquidation behavior, called paths would retain most of the SSO/UPRO sleeve value, making mixed strategies even better at the tail. The min boot wealth gap ($0 for 25/50/25 vs $0.22M for 100% SSO) is artifact of the conservative model.
+
+### Other findings
+
+- **100% hybrid still wins p10** across all scenarios. If downside protection is paramount, no mix beats pure hybrid.
+- **UPRO is tail-risky in lump-sum scenarios** (Scenario C: 19% of UPRO-only paths end below initial $1M capital) but acceptable in heavy-DCA scenarios because DCA dilutes vol drag impact on bad paths.
+- **Three-way mixes consistently appear on the Pareto frontier** — the right-tail of UPRO + moderate vol drag of SSO + collateral-leveraged hybrid sleeve compound nicely.
+- **Best by criterion** depends on user preference: 100% hybrid for p10 protection; 25/50/25 for Pareto-strong risk-tolerant; 0/0/100 (UPRO) for max p50 only with heavy DCA.
+
+### Streamlit page features
+
+- Per-scenario calibration cached via `@st.cache_data` (re-runs of same scenario are instant).
+- Standalone hybrid T_rec shown as reference (so user can see the lift from collateral support).
+- Pareto frontier marked in results table.
+- 5 "best-by-criterion" rows: best p10 (downside), best p50 (median EV), best p90 (upside), best min wealth (extreme tail), best <C% (fewest below-initial paths).
+- Bar charts for percentiles + tail metrics across allocations.
+- Default 16-allocation grid (4 pure cases + 9 two-way mixes + 4 three-way mixes); free-form text input lets user add/remove allocations.
+
+### Open question
+
+- **Partial-liquidation modelling**. The conservative wipeout model under-represents mixed strategies' true tail behavior. A future enhancement would model broker partial liquidation (sell just enough to satisfy maintenance, preferentially from highest-mm position) — likely shifts the boot tail metrics meaningfully in favor of mixed strategies.
+- **Realistic broker rules for leveraged ETFs**. Some brokers prohibit leveraged ETFs as margin collateral; others have higher mm requirements. The 50%/75% mm we use is the FINRA standard, but per-broker variation matters in practice.
+- **Pareto-search over allocation grid**. Currently the user supplies allocations manually. An automated search (greedy hill-climb or random-search over the simplex) could find Pareto-optimal mixes the user wouldn't think to try.
+
+---
+
 ## 6. Practical recommendations
 
 For the user's stated situation (taxable, hold-forever, SPX only, broker margin, with ongoing savings contributions):
@@ -1547,6 +1612,15 @@ This is the most architecturally clean strategy: single parameter, closed-form r
 - Requires monthly rebalancing and tracking running drawdown
 - Pareto-dominates wealth-decay and time-decay (better bootstrap robustness at similar/better IRR)
 - Ends nicely deleveraged (~1.05x by year 30) due to ratchet
+
+### Tier 2c — 3-way mixed strategy (Pareto-strong if you accept multiple instruments)
+
+**25% hybrid + 50% SSO + 25% UPRO** with shared margin collateral and DCA-only rebalancing.
+- **Pareto-dominates 100% SSO** on all percentiles (p10/p50/p90, hist + boot)
+- p10 only ~17% below 100% hybrid, p50 ~25% above, p90 ~5× above
+- 1% boot call rate (vs 0% for pure SSO/UPRO) — but called paths retain most wealth in real broker partial-liquidation
+- Hybrid sleeve runs at peak leverage 4.58x thanks to combined collateral
+- See `pages/Mixed_Analysis.py` (Streamlit page) for interactive sweep across allocations
 
 ### Tier 2b — daily-leveraged ETF (PARALLEL CHOICE TO HYBRID)
 

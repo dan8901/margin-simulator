@@ -1988,6 +1988,204 @@ def fmt_money(x):
     return f"${x / 1e3:>6.0f}k"
 
 
+# ---------------------------------------------------------------------------
+# 3-way mixed strategy: hybrid + SSO + UPRO with shared collateral
+# ---------------------------------------------------------------------------
+
+@numba.njit(cache=True, fastmath=True)
+def simulate_3way(ret, tsy, cpi, T_init, h_hyb, h_sso, h_upro,
+                   C, S, T_yrs, S2, max_days, avail, F, floor, wealth_X,
+                   broker_bump_days):
+    """3-sleeve simulation with shared margin collateral + DCA rebalancing.
+
+    Sleeves:
+      hybrid: stocks_h (SPX), loan_h. Hybrid logic on sleeve equity.
+      sso:    stocks_sso, daily-reset 2x SPX.
+      upro:   stocks_upro, daily-reset 3x SPX.
+
+    Combined-collateral margin call check (Reg-T leveraged-ETF maint):
+      loan_h ≤ 0.75·stocks_h + 0.50·stocks_sso + 0.25·stocks_upro
+
+    DCA rule (no selling): each contribution day, route by underweight
+    deficit vs target allocation. If all sleeves at-or-above target,
+    route at target proportions.
+
+    Hybrid sleeve uses dd_decay ratchet ∧ wealth_decay glide on TOTAL
+    real wealth (not sleeve wealth — wealth_X applies to the whole
+    portfolio).
+
+    Returns: (real_eq[K, max_days+1], called[K], peak_lev_h[K])
+    """
+    K = ret.shape[0]
+    stocks_h = np.full(K, h_hyb * C * T_init)
+    loan_h = np.full(K, h_hyb * C * (T_init - 1.0))
+    stocks_sso = np.full(K, h_sso * C)
+    stocks_upro = np.full(K, h_upro * C)
+    hwm_eq = np.full(K, h_hyb * C if h_hyb > 0 else 1.0)
+    max_dd = np.zeros(K)
+    called = np.zeros(K, dtype=np.bool_)
+    peak_lev = np.full(K, T_init)
+
+    real_eq = np.full((K, max_days + 1), np.nan)
+    for k in range(K):
+        real_eq[k, 0] = C
+
+    t_switch_days = T_yrs * TD
+
+    for d in range(1, max_days + 1):
+        s_real_yr = S if d < t_switch_days else S2
+        do_rebal = (d % REBAL_DAYS == 0)
+
+        for k in range(K):
+            if called[k] or d > avail[k]:
+                continue
+
+            stocks_h_new = stocks_h[k] * (1.0 + ret[k, d])
+            if h_hyb > 0.0:
+                if d <= broker_bump_days:
+                    rate = tsy[k, d] + BROKER_BPS
+                else:
+                    rate = (tsy[k, d] + BOX_BPS) * (1.0 - BOX_TAX_BENEFIT)
+                loan_h_new = loan_h[k] * (1.0 + rate / TD)
+            else:
+                loan_h_new = 0.0
+
+            fin_rate = tsy[k, d] + ETF_FIN_BPS
+            drift_sso = 2.0 * ret[k, d] - (ETF_EXPENSE_RATIO + fin_rate) / TD
+            if drift_sso <= -1.0:
+                stocks_sso_new = 0.0
+            else:
+                stocks_sso_new = stocks_sso[k] * (1.0 + drift_sso)
+
+            drift_upro = 3.0 * ret[k, d] - (ETF_EXPENSE_RATIO + 2.0 * fin_rate) / TD
+            if drift_upro <= -1.0:
+                stocks_upro_new = 0.0
+            else:
+                stocks_upro_new = stocks_upro[k] * (1.0 + drift_upro)
+
+            if s_real_yr > 0.0:
+                infl = cpi[k, d] / cpi[k, 0]
+                contrib = s_real_yr * infl / TD
+
+                eq_h_pre = stocks_h_new - loan_h_new
+                tot_pre = eq_h_pre + stocks_sso_new + stocks_upro_new
+                if tot_pre > 0.0:
+                    cur_h = eq_h_pre / tot_pre
+                    cur_s = stocks_sso_new / tot_pre
+                    cur_u = stocks_upro_new / tot_pre
+                else:
+                    cur_h = h_hyb
+                    cur_s = h_sso
+                    cur_u = h_upro
+
+                d_h = h_hyb - cur_h
+                d_s = h_sso - cur_s
+                d_u = h_upro - cur_u
+                if d_h < 0.0: d_h = 0.0
+                if d_s < 0.0: d_s = 0.0
+                if d_u < 0.0: d_u = 0.0
+                total_def = d_h + d_s + d_u
+                if total_def > 0.0:
+                    w_h = d_h / total_def
+                    w_s = d_s / total_def
+                    w_u = d_u / total_def
+                else:
+                    w_h = h_hyb
+                    w_s = h_sso
+                    w_u = h_upro
+
+                stocks_h_new += contrib * w_h
+                stocks_sso_new += contrib * w_s
+                stocks_upro_new += contrib * w_u
+
+            max_loan = (0.75 * stocks_h_new + 0.50 * stocks_sso_new
+                        + 0.25 * stocks_upro_new)
+            if loan_h_new > max_loan:
+                called[k] = True
+                continue
+            total_eq = (stocks_h_new + stocks_sso_new + stocks_upro_new
+                        - loan_h_new)
+            if total_eq <= 0.0:
+                called[k] = True
+                continue
+
+            stocks_h[k] = stocks_h_new
+            loan_h[k] = loan_h_new
+            stocks_sso[k] = stocks_sso_new
+            stocks_upro[k] = stocks_upro_new
+
+            total_real_eq = total_eq * cpi[k, 0] / cpi[k, d]
+
+            if stocks_h[k] - loan_h[k] > 0.0 and h_hyb > 0.0:
+                lev_h = stocks_h[k] / (stocks_h[k] - loan_h[k])
+                if lev_h > peak_lev[k]:
+                    peak_lev[k] = lev_h
+
+            if do_rebal and h_hyb > 0.0:
+                eq_h = stocks_h[k] - loan_h[k]
+                if eq_h > 0.0:
+                    if eq_h > hwm_eq[k]:
+                        hwm_eq[k] = eq_h
+                    if hwm_eq[k] > 0.0:
+                        dd_now = 1.0 - eq_h / hwm_eq[k]
+                        if dd_now > max_dd[k]:
+                            max_dd[k] = dd_now
+                    cand_dd = T_init - F * max_dd[k]
+                    if cand_dd < floor:
+                        cand_dd = floor
+
+                    if wealth_X > C:
+                        prog = (total_real_eq - C) / (wealth_X - C)
+                        if prog < 0.0:
+                            prog = 0.0
+                        elif prog > 1.0:
+                            prog = 1.0
+                        cand_w = T_init - (T_init - floor) * prog
+                    else:
+                        cand_w = floor
+
+                    target_lev = cand_dd if cand_dd < cand_w else cand_w
+                    delta = target_lev * eq_h - stocks_h[k]
+                    if delta > 0.0:
+                        new_loan = loan_h[k] + delta
+                        new_max = (0.75 * (stocks_h[k] + delta)
+                                    + 0.50 * stocks_sso[k]
+                                    + 0.25 * stocks_upro[k])
+                        if new_loan <= new_max:
+                            stocks_h[k] += delta
+                            loan_h[k] += delta
+
+            real_eq[k, d] = total_real_eq
+
+    return real_eq, called, peak_lev
+
+
+def find_safe_T_3way(ret, tsy, cpi, h_hyb, h_sso, h_upro,
+                      C, S, T_yrs, S2, max_days, avail, F, floor, wealth_X,
+                      broker_bump_days, target_call_rate,
+                      lo=1.0, hi=4.0, n_iters=12):
+    """Binary search for largest T_init with call_rate ≤ target.
+
+    Returns 1.0 immediately if h_hyb == 0 (no hybrid sleeve, T meaningless).
+    """
+    if h_hyb <= 0.0:
+        return 1.0
+    best = lo
+    for _ in range(n_iters):
+        mid = (lo + hi) / 2.0
+        _, called, _ = simulate_3way(
+            ret, tsy, cpi, mid, h_hyb, h_sso, h_upro,
+            C, S, T_yrs, S2, max_days, avail, F, floor, wealth_X,
+            broker_bump_days)
+        cr = float(called.mean())
+        if cr <= target_call_rate:
+            best = mid
+            lo = mid
+        else:
+            hi = mid
+    return best
+
+
 def run():
     args = parse_args()
     dates, px, tsy, mrate, cpi = load(with_cpi=True)
