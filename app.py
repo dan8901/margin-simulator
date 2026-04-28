@@ -97,7 +97,7 @@ PERSISTED_KEYS = [
     "show_static", "show_relever", "show_dd", "show_adaptive", "show_wealth",
     "show_adaptive_hybrid", "show_hybrid", "show_r_hybrid", "show_vol_hybrid",
     "show_dip_hybrid", "show_rate_hybrid", "show_recal", "show_recal_hybrid",
-    "show_recal_adaptive_dd", "show_meta_recal",
+    "show_recal_adaptive_dd", "show_meta_recal", "show_sso", "show_upro",
     # Strategy params
     "dd_F", "wealth_X_M", "wealth_glide_exp", "vol_factor",
     "dip_threshold_pct", "dip_bonus", "rate_threshold_pct", "rate_factor",
@@ -271,6 +271,23 @@ with st.sidebar:
             help="At each re-cal, looks up T_max for static / dd_decay / "
                  "adaptive_dd / hybrid and picks the strategy with the "
                  "highest. Between recals, applies that strategy's logic.")
+        st.markdown("---")
+        st.caption("Daily-leveraged ETFs (no margin call possible — daily reset trades call risk for volatility drag)")
+        show_sso = st.checkbox(
+            "SSO (2x daily SPX)", value=False, key="show_sso",
+            help="ProShares SSO: 2x daily SPX exposure via swaps. No margin "
+                 "call risk by construction (daily reset). Costs: 0.91%/yr "
+                 "expense ratio + ~70 bps over Tsy_3m financing on 1x of "
+                 "swap notional. Vol drag ≈ 0.3%/yr at 16% SPX vol. "
+                 "DCA buys more SSO; daily reset maintains 2x automatically. "
+                 "Constants empirically calibrated to real SSO TR (2006-2026).")
+        show_upro = st.checkbox(
+            "UPRO (3x daily SPX)", value=False, key="show_upro",
+            help="ProShares UPRO: 3x daily SPX exposure via swaps. No margin "
+                 "call risk. Costs: 0.91%/yr ER + ~70 bps over Tsy_3m on 2x "
+                 "swap notional. Vol drag ≈ 0.8%/yr at 16% SPX vol "
+                 "(3x SSO's drag). DCA buys more UPRO; daily reset maintains "
+                 "3x automatically. Calibrated to real UPRO TR (2009-2026).")
         recal_period_months = st.slider(
             "recal period (months)", 1, 180, 60, step=1, key="recal_period_months",
             help="How often re-cal strategies re-calibrate. 60 (5y) is the "
@@ -428,6 +445,10 @@ def selected_strategies():
         out.append(("recal_adaptive_dd", dict(kind="recal_adaptive_dd", F=dd_F, floor=1.0)))
     if show_meta_recal:
         out.append(("meta_recal", dict(kind="meta_recal", F=dd_F, floor=1.0)))
+    if show_sso:
+        out.append(("sso", dict(kind="sso")))
+    if show_upro:
+        out.append(("upro", dict(kind="upro")))
     return out
 
 
@@ -475,6 +496,10 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
             strategies.append((name, dict(kind="recal_adaptive_dd", F=dd_F, floor=1.0)))
         elif name == "meta_recal":
             strategies.append((name, dict(kind="meta_recal", F=dd_F, floor=1.0)))
+        elif name == "sso":
+            strategies.append((name, dict(kind="sso")))
+        elif name == "upro":
+            strategies.append((name, dict(kind="upro")))
     checkpoints = list(checkpoints_tuple)
 
     # Common kwargs for every simulate/calibration call (overlay params)
@@ -627,6 +652,21 @@ def compute(C, S, T, S2, max_days, checkpoints_tuple, strategies_tuple,
     for name, spec in strategies:
         kind = spec["kind"]
         F = spec.get("F", 1.5)
+
+        # Daily-leveraged ETFs (sso, upro): no T_init to calibrate. The
+        # multiplier is baked into the daily-reset construction (2x or 3x).
+        # Margin calls are impossible by construction, so all safety bars
+        # report 0% calls. T_rec equals the ETF multiplier (informational).
+        if kind in ("sso", "upro"):
+            etf_N = 2.0 if kind == "sso" else 3.0
+            calibrated[name] = dict(spec=spec, T_hist=etf_N,
+                                     boot_at_hist=0.0,
+                                     T_boot=etf_N,
+                                     T_stress=etf_N if ret_s is not None else None,
+                                     T_rec=etf_N,
+                                     init_base_kind=None,
+                                     init_strat_idx=0)
+            continue
 
         # For recal_static / recal_hybrid / recal_adaptive_dd: calibrate
         # using the base kind, NOT the recal trajectory. The recal lookup

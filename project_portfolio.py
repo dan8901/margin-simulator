@@ -101,6 +101,14 @@ BOX_TAX_BENEFIT = 0.00
 # since broker margin interest is plain investment-interest expense, not
 # Section 1256.
 BROKER_BPS = 0.0150
+# Daily-leveraged-ETF (SSO/UPRO) parameters. ProShares both list 0.91%/yr
+# expense ratio. The financing-spread constant was empirically calibrated
+# in `verify_etf_sim.py` to match real SSO (2006-06+) and real UPRO
+# (2009-06+) total returns to within ~0.1% of cumulative wealth: best-fit
+# spread is 73 bps for SSO and 65 bps for UPRO; 70 bps is the average and
+# is a tight fit for both (CAGR error <10 bps on either leg).
+ETF_EXPENSE_RATIO = 0.0091
+ETF_FIN_BPS = 0.0070
 CALL_THRESHOLD = 4.0
 REBAL_DAYS = 21
 PATH_DTYPE = np.float32   # halves memory vs float64; ~7-digit precision is plenty
@@ -447,8 +455,24 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
     """
     K = ret.shape[0]
     n_cp = checkpoint_days.shape[0]
-    stocks = np.full(K, C * T_init)
-    loan = np.full(K, C * (T_init - 1.0))
+    # Daily-leveraged ETFs (kind 15=SSO, 16=UPRO): equity = stocks (no loan),
+    # peak leverage = ETF multiplier (constant by design of the daily reset).
+    is_etf = (kind_code == 15) or (kind_code == 16)
+    if kind_code == 15:
+        etf_N = 2.0
+    elif kind_code == 16:
+        etf_N = 3.0
+    else:
+        etf_N = 1.0
+
+    if is_etf:
+        stocks = np.full(K, float(C))
+        loan = np.zeros(K)
+        peak_lev = np.full(K, etf_N)
+    else:
+        stocks = np.full(K, C * T_init)
+        loan = np.full(K, C * (T_init - 1.0))
+        peak_lev = np.full(K, float(T_init))
     hwm_eq = np.full(K, float(C))
     max_dd = np.zeros(K)
     max_w_prog = np.zeros(K)   # ratcheted wealth progress (kind=5)
@@ -457,7 +481,6 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
     strat_active = np.full(K, init_strat_idx, dtype=np.int64)   # meta_recal: index of selected strategy
     called = np.zeros(K, dtype=np.bool_)
     cap_reached = np.zeros(K, dtype=np.bool_)
-    peak_lev = np.full(K, float(T_init))
 
     real_eq = np.full((K, max_days + 1), np.nan)
     # Per-checkpoint leverage capture: shape (K, n_cp, 2) where
@@ -469,8 +492,9 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
         real_eq[k, 0] = C
 
     t_switch_days = T_yrs * TD
-    # recal_* kinds may add loan later via lookup; treat them as always levered
-    is_levered = (T_init > 1.0) or (kind_code >= 11)
+    # recal_* kinds may add loan later via lookup; treat them as always levered.
+    # ETF kinds (15, 16) hold the ETF outright with no margin loan.
+    is_levered = ((T_init > 1.0) or (kind_code >= 11)) and not is_etf
     cp_idx = 0   # which checkpoint comes next
 
     for d in range(1, max_days + 1):
@@ -488,6 +512,36 @@ def _simulate_core(ret, tsy, cpi, kind_code, T_init, C, S, T_yrs, S2, max_days,
 
         for k in range(K):
             if called[k] or d > avail[k]:
+                continue
+
+            if is_etf:
+                # Daily-reset N-x ETF: r_etf = N*r_spx - (ER + (N-1)*(tsy + spread)) / TD.
+                # No loan, no margin call possible — daily reset replaces call risk
+                # with continuous volatility drag. Constants calibrated against
+                # real SSO/UPRO TR (verify_etf_sim.py).
+                # Wipeout guard: if a single day's drift would make the ETF
+                # value negative (only possible at N=3 with -33%+ SPX days, which
+                # never happened post-1932 but can occur under heavy stretching),
+                # the ETF is effectively terminated. Treat as called and freeze.
+                fin_rate = tsy[k, d] + ETF_FIN_BPS
+                drift = etf_N * ret[k, d] - (ETF_EXPENSE_RATIO + (etf_N - 1.0) * fin_rate) / TD
+                if drift <= -1.0:
+                    called[k] = True
+                    stocks[k] = 0.0
+                    if is_cp:
+                        lev_at_cp[k, cp_idx, 0] = etf_N
+                        lev_at_cp[k, cp_idx, 1] = etf_N
+                    continue
+                stocks_new = stocks[k] * (1.0 + drift)
+                if s_real_yr > 0.0:
+                    stocks_new = stocks_new + s_real_yr * cpi[k, d] / cpi[k, 0] / TD
+                stocks[k] = stocks_new
+                # No loan, no rebalance, no call check. Effective leverage is
+                # etf_N constant by daily-reset construction.
+                if is_cp:
+                    lev_at_cp[k, cp_idx, 0] = etf_N
+                    lev_at_cp[k, cp_idx, 1] = etf_N
+                real_eq[k, d] = stocks[k] * cpi[k, 0] / cpi[k, d]
                 continue
 
             stocks_new = stocks[k] * (1.0 + ret[k, d])
@@ -1076,7 +1130,8 @@ _KIND_CODES = {"static": 0, "relever": 1, "dd_decay": 2,
                "r_hybrid": 5, "vol_hybrid": 6, "dip_hybrid": 7,
                "rate_hybrid": 8, "adaptive_dd": 9, "adaptive_hybrid": 10,
                "recal_static": 11, "recal_hybrid": 12,
-               "recal_adaptive_dd": 13, "meta_recal": 14}
+               "recal_adaptive_dd": 13, "meta_recal": 14,
+               "sso": 15, "upro": 16}
 
 
 def simulate(ret, tsy, cpi, kind, T_init, C, S, T_yrs, S2, max_days,
@@ -1817,6 +1872,14 @@ def find_max_safe_T_grid(ret, tsy, cpi, kind, target, C, S, T_yrs, S2, max_days,
     elif avail.dtype != np.int64:
         avail = avail.astype(np.int64)
     kind_code = _KIND_CODES[kind]
+
+    # Daily-leveraged ETFs have no T_init to calibrate (the multiplier is
+    # baked into the daily-reset construction). Return N as the constant
+    # "target" so callers can uniformly inspect a leverage value.
+    if kind_code == 15:
+        return 2.0
+    if kind_code == 16:
+        return 3.0
 
     if t_recal_table is None:
         t_recal_table = np.zeros((1, 1), dtype=np.float64)

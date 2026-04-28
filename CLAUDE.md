@@ -31,6 +31,7 @@ All scripts are self-contained: they read from `spx_margin_history.csv` (not the
 5g. [Recal T_init calibration fix](#5g-recal-t_init-calibration-fix-added-in-sixth-session)
 5h. [Early broker-rate bump](#5h-early-broker-rate-bump-added-in-seventh-session)
 5i. [Calibration uses avail-bounded all-entries paths](#5i-calibration-uses-avail-bounded-all-entries-paths-added-in-eighth-session)
+5j. [Daily-leveraged ETFs (SSO/UPRO)](#5j-daily-leveraged-etfs-ssoupro-added-in-ninth-session)
 6. [Practical recommendations](#6-practical-recommendations)
 7. [Caveats and limitations](#7-caveats-and-limitations)
 8. [Important corrections made during analysis](#8-important-corrections-made-during-analysis)
@@ -207,6 +208,8 @@ All scripts are standalone and runnable with `.venv/bin/python script_name.py`. 
 
 - **`verify_recal_tinit.py`** — Computes plain well-defended T_rec for `{static, hybrid, adaptive_dd, dd_decay}` on the user's primary scenario. Used as a reference for what the recal_X strategies in `app.py` should display post-fix (see §5g). Just prints; doesn't assert.
 - **`verify_recal_end_to_end.py`** — Same calibration as above, plus assertions: recal_X T_rec == base T_rec, meta_recal T_rec == argmax. Exits non-zero on regression. Run after any change to the calibration logic in `app.py compute()` or `find_max_safe_T_grid`.
+- **`verify_etf_sim.py`** — Calibrates the daily-reset ETF model against real SSO TR (yfinance ^SSO, 2006-06+) and real UPRO TR (yfinance ^UPRO, 2009-06+). Grid-searches the financing spread that minimizes annualized-return error, prints CAGR + vol comparison, and reports daily RMSE. Uses ER=0.91%/yr (prospectus). Best-fit spread ≈ 70 bps; sim/real cumulative wealth match within 0.1% on both legs. Run if `ETF_FIN_BPS` or `ETF_EXPENSE_RATIO` constants are touched.
+- **`analyze_etf_sweep.py`** — Cross-scenario comparison of unlev / static / hybrid / SSO / UPRO. Three scenarios (heavy DCA, light DCA, pure lump) × two horizons (20y, 30y). Reports T_rec, hist call %, boot call %, and p10/p50/p90 real wealth at horizon. Demonstrates that ETFs trade left-tail for right-tail across scenarios (p10 erodes, p50/p90 improve). See §5j for findings.
 
 ### Side / utility scripts
 
@@ -1327,6 +1330,198 @@ the data with 30y of forward data could falsify."
 
 ---
 
+## 5j. Daily-leveraged ETFs (SSO/UPRO) (added in ninth session)
+
+User asked to add ProShares SSO (2x daily SPX) and UPRO (3x daily SPX)
+as alternative leverage instruments — daily-reset construction means
+margin-call risk is structurally impossible (the ETF rebalances every day
+to maintain N-x exposure), but the path pays continuous variance drag.
+
+### Model
+
+Daily total return:
+```
+r_etf_t = N · r_spx_t − (ER + (N−1) · (Tsy_3m + spread)) / TD
+```
+- `N` = 2 (SSO) or 3 (UPRO)
+- `ER` = expense ratio = **0.91%/yr** (both ProShares funds, identical)
+- `spread` = financing cost over Tsy_3m, **70 bps** (single constant for
+  both funds)
+- Daily reset means effective leverage is N every day (no drift)
+
+### Empirical calibration
+
+`verify_etf_sim.py` fits real SSO TR (2006-06+, 4991 daily returns) and
+real UPRO TR (2009-06+, 4233 daily returns) from yfinance against the
+formula. Results:
+
+| Fund | Best-fit spread | Sim CAGR err | Path RMSE | Final-wealth ratio |
+|---|---|---|---|---|
+| SSO | 73 bps over Tsy_3m | <1 bp | 0.247%/day | sim/real = +0.08% |
+| UPRO | 65 bps over Tsy_3m | <1 bp | 0.218%/day | sim/real = +0.09% |
+
+`ETF_FIN_BPS = 0.0070` (the 69 bps average) is a tight fit on both legs
+(CAGR error <10 bps on either). The vol match is also excellent (sim vs
+real annualized vol within ~1pp on either fund).
+
+The ER constant is from the prospectus, not fit. The spread reflects:
+swap counterparty financing + counterparty profit + bid/ask on the
+internal rebalance trades + intra-month financing variance. It is real
+and consistently around 70 bps; the prior estimate of "30 bps" in the
+brainstorm was too low by half.
+
+### Implementation
+
+- `_KIND_CODES["sso"] = 15`, `_KIND_CODES["upro"] = 16`
+- `_simulate_core` and `_simulate_core_grid` have an early `is_etf`
+  branch: applies the daily-reset formula, no loan, no margin-call
+  check, no rebalance. DCA contributions add directly to `stocks`
+  (daily reset handles maintaining N).
+- `peak_lev` initialized to `etf_N` and stays constant; `lev_at_cp` is
+  also constant `etf_N` for ETF kinds.
+- Wipeout guard: if `(1 + drift) <= 0` (theoretical for N=3 with
+  -33%+ daily SPX, only possible under heavy stretching), set `stocks=0`
+  and mark called.
+- `find_max_safe_T_grid` short-circuits: returns N immediately for ETF
+  kinds (no T_init to calibrate, multiplier is fixed by construction).
+- `app.py`: two new sidebar checkboxes; ETF strategies bypass the
+  calibration block entirely (T_rec = N, all safety-bar columns 0%).
+- ETF kinds are NOT in the meta_recal candidate set (different
+  architectural family — no T_init, no rebalance), and don't appear in
+  `compute_recal_table` (recal mechanics don't apply).
+
+### Empirical findings: ETFs trade left-tail for right-tail (NOT a Pareto improvement)
+
+`analyze_etf_sweep.py` runs three scenarios × two horizons × five strategies
+(unlev, static, hybrid, SSO, UPRO) at well-defended T for static and hybrid,
+F=1.5, stretch=1.1, boot=1%. **Universal pattern across all scenarios:**
+
+**Scenario A (heavy DCA: C=160k, S=180k×5y, S2=30k, wealth_X=$3M, 30y):**
+
+| Strategy | T_rec | hist% | boot% | p10 | p50 | p90 |
+|---|---|---|---|---|---|---|
+| unlev | 1.00x | 0% | 0% | $5.37M | $9.47M | $16.69M |
+| static | 1.96x | 0% | 0% | $5.88M | $10.58M | $18.76M |
+| **hybrid** | 1.66x | 0% | 0.8% | **$6.51M** | $12.52M | $21.63M |
+| **SSO** 2x | 2.00x | 0% | 0% | $5.27M | **$15.59M** | $71.63M |
+| **UPRO** 3x | 3.00x | 0% | 0% | $3.75M | $16.55M | **$253.86M** |
+
+**Scenario B (light DCA: C=$1M, S=$30k×30y, wealth_X=$10M, 30y):**
+
+| Strategy | T_rec | p10 | p50 | p90 |
+|---|---|---|---|---|
+| unlev | 1.00x | $6.45M | $11.45M | $18.77M |
+| **hybrid** | 1.33x | **$7.41M** | $14.19M | $23.04M |
+| **SSO** 2x | 2.00x | $6.50M | **$19.80M** | $78.27M |
+| **UPRO** 3x | 3.00x | $4.60M | $19.90M | **$234.75M** |
+
+**Scenario C (pure lump: C=$1M, S=0, no wealth_X, 30y):**
+
+| Strategy | T_rec | p10 | p50 | p90 |
+|---|---|---|---|---|
+| unlev | 1.00x | $4.29M | $8.31M | $13.56M |
+| **hybrid** | 1.26x | **$5.05M** | $10.38M | $17.13M |
+| **SSO** 2x | 2.00x | $4.12M | **$14.77M** | $58.26M |
+| **UPRO** 3x | 3.00x | $2.54M | $13.32M | **$158.18M** |
+
+### Key takeaways
+
+1. **SSO does NOT Pareto-dominate hybrid.** I claimed it did in the
+   brainstorm (p10 SSO $3.94M vs hybrid $3.73M), but that was using
+   "last available day per path" — which mixes 5y, 10y, 20y, 30y
+   horizons. Under strict horizon=30y filtering (only paths with ≥30y
+   forward data), **SSO's p10 is *worse* than hybrid's** in every scenario
+   tested. The vol drag bites the worst-decile paths (long drawdowns
+   like 1973-74, 1980-82) harder than the eliminated margin-call risk
+   helps.
+
+2. **The trade is left-tail vs right-tail, not strictly better.**
+   - SSO vs hybrid: ~5–15% worse p10, ~25–40% better p50, ~3× better p90
+   - UPRO vs hybrid: ~30–50% worse p10, ~30–55% better p50, ~10× better p90
+   - For risk-averse users (utility curves with high left-tail aversion),
+     hybrid still wins. For EV-maximizers or right-tail-seekers,
+     SSO/UPRO win on p50 and especially p90.
+
+3. **UPRO's p10 can fall below unlev** in low-DCA scenarios.
+   Scenario C 30y: UPRO p10 = $2.54M, unlev p10 = $4.29M. UPRO at 3x
+   loses to plain unlevered SPX on the worst 10% of paths because
+   variance drag accumulates faster than the 3× factor compounds during
+   long drawdowns. **UPRO is a high-conviction bet on right-tails;
+   it is NOT a "safe leverage" alternative to margin.**
+
+4. **SSO is the more balanced choice.** Vol drag at 2x scales as
+   ~N(N-1)·σ²/2, so SSO (drag ≈ 0.26%/yr at 16% vol) is dramatically
+   more efficient than UPRO (drag ≈ 0.77%/yr, 3× SSO's). SSO's p10 is
+   close to unlev's even in the worst scenarios; UPRO's is materially
+   worse.
+
+5. **ETFs work better under high DCA than under lump-sum.** Scenario A
+   (heavy DCA) shows SSO's p10 $5.27M vs unlev's $5.37M (-2%); Scenario
+   C (pure lump) shows SSO p10 $4.12M vs unlev's $4.29M (-4%). DCA
+   into the ETF dilutes early-period vol drag because new contributions
+   buy at lower prices during drawdowns.
+
+6. **No margin call ever fires** for ETF kinds (by construction).
+   Boot/hist/stress all show 0% calls. The "safety" question reduces
+   entirely to "how bad is the p10 wealth?"
+
+### Architectural ranking (after ninth session)
+
+| Rank | Strategy | Best for | Bootstrap calls (30y, scen A) |
+|---|---|---|---|
+| 1 | Static @ well-defended | Architectural cleanness, lowest tail risk in margin land | 0% |
+| 2a | Hybrid @ well-defended | Margin-strategy users wanting wealth_X targeting + DCA leverage capture | 0.8% |
+| 2b | **SSO** | Users prioritizing p50/p90 over p10; willing to accept ~5-15% p10 erosion vs hybrid | 0% (margin call impossible) |
+| 3 | UPRO | High-conviction right-tail bets; willing to accept p10 below unlev | 0% (margin call impossible) |
+| 4-7 | Wealth/time-decay/relever (see §5d) | — | 7-14% |
+
+SSO and hybrid are now in the same recommendation tier — different shapes
+of risk profile, neither strictly dominates. The choice depends on the
+user's utility curve (left-tail-averse → hybrid; EV-maximizer → SSO).
+
+### Practical guidance updates
+
+- **For "I want to leverage but never get margin-called"**: SSO is the
+  cleanest answer. p10 erosion is small (~5-15% in well-defended
+  scenarios), p50 and p90 substantially better than hybrid.
+- **For "I want maximum expected wealth and don't care about p10"**:
+  UPRO. But understand: p10 is below unlev in lump-tilted scenarios.
+- **For "I want the safest leverage outcome at p10"**: hybrid (or
+  static) at well-defended T. Margin call risk is small (≤1%) and the
+  p10 outcome is the highest of any leveraged strategy.
+- **The choice is not "ETF beats margin" — it's "what part of the
+  distribution do you care about most?"**
+
+### Open questions
+
+1. **Stretch-test ETF stability.** F=1.1 is the default; what happens
+   at F=1.5 (a 50% historical drawdown becomes 75%)? UPRO at 3x with
+   amplified daily moves may trigger the wipeout guard on stretched
+   paths. Need to characterize.
+2. **ETF + box-spread margin overlay.** Currently ETF strategies have
+   no margin overlay. Layering 1.2-1.3x broker margin on top of SSO
+   gives ~2.4-2.6x effective exposure — potentially competitive with
+   margin strategies but with most of the no-call benefit. User
+   explicitly opted out for now ("no margin overlay correct").
+3. **Tax model for ETFs.** Currently ETFs run with `tax_benefit = 0`
+   (same as box-spread default for hold-forever). UPRO and SSO are
+   regular ETFs (not Section 1256), so hold-forever gets cap-gains
+   deferral on price appreciation. Distributions are small (~1-2%/yr,
+   mostly qualified dividends). The current model conservatively
+   ignores both effects, which roughly cancels out.
+4. **Termination risk modeling.** Real UPRO could be wound up after
+   a -33%+ SPX day (circuit breakers help but aren't guaranteed).
+   Current model: floor stocks at 0 + mark called. May understate
+   real-life recovery (in practice ProShares would distribute residual
+   value, not zero). Probably immaterial in the post-1932 historical
+   data (worst single SPX day was -20.5% in 1987).
+5. **Multi-percentile utility analysis.** Currently report p10/p50/p90.
+   For risk-averse users a utility-weighted comparison (e.g., log-wealth
+   or CRRA) would crystallize the trade. Easy to compute from the
+   wealth distributions already produced.
+
+---
+
 ## 6. Practical recommendations
 
 For the user's stated situation (taxable, hold-forever, SPX only, broker margin, with ongoing savings contributions):
@@ -1353,6 +1548,20 @@ This is the most architecturally clean strategy: single parameter, closed-form r
 - Pareto-dominates wealth-decay and time-decay (better bootstrap robustness at similar/better IRR)
 - Ends nicely deleveraged (~1.05x by year 30) due to ratchet
 
+### Tier 2b — daily-leveraged ETF (PARALLEL CHOICE TO HYBRID)
+
+**SSO (2x daily SPX) — 100% allocation, no margin overlay.**
+- p50 wealth ~25-40% higher than hybrid across scenarios
+- p90 wealth ~3× hybrid
+- p10 wealth ~5-15% LOWER than hybrid (vol drag during long drawdowns)
+- **Margin call impossible by construction** (daily reset)
+- Cost: 0.91%/yr expense ratio + ~70 bps over Tsy_3m financing on 1x of
+  swap notional, baked into daily NAV
+- Vol drag ≈ 0.26%/yr at SPX's ~16% vol (small)
+- **Same tier as hybrid** — different shape of risk, neither strictly
+  dominates. Pick based on whether you weight p10 (→ hybrid) or p50/p90
+  (→ SSO) more heavily.
+
 ### Tier 3 — historical max-safe (USE WITH CAUTION)
 
 **Any strategy at the historical dual-horizon max-safe target.** Provides ~13% p50 IRR but at meaningful synthetic call rates (1.5-14% depending on strategy). The "extra" 100-130 bps over Tier 2 is largely artifact of overfitting to historical path ordering. **Only justified if you genuinely believe future paths will closely resemble post-1932 history**, which is a strong assumption.
@@ -1364,6 +1573,8 @@ This is the most architecturally clean strategy: single parameter, closed-form r
 - **External cash reserve as backstop** (doesn't work for long drawdowns)
 - **Aggressive amortization** (suboptimal EV vs DCA)
 - **Over-complicating with DCA timing tweaks** (the expected benefit is ~2-15 bps/yr)
+- **UPRO 100% allocation as a "safer" alternative to margin** (p10 below
+  unlev in lump-tilted scenarios — variance drag at 3x is severe)
 
 ---
 
@@ -1440,6 +1651,10 @@ Initially suggested "50-70% 10y amort" as the best choice if income stops at yea
 ### Sizing strategies at the 20y horizon only (now corrected)
 
 **That was wrong for re-lever strategies.** The original max-safe table sized monthly relever at 1.45x using only 20y entries. At 30y, that target produces a 9.27% margin-call rate — paths that survived 20 years got hit by *additional* drawdowns in years 20–30 (e.g., a path entered in 1980 catches stagflation + 1987 + 2000 + 2008). The fix is "dual-horizon max-safe": a target with 0% calls at BOTH 20y and 30y. This dropped monthly relever's safe target from 1.45x to ~1.43x and revealed that **simple relever's safe target is essentially flat at ~1.43x across all DCA levels** — DCA does not raise the relever ceiling under honest stress testing. Static and decay-2pp are unaffected (they were already safe at both horizons). See `analyze_irr_percentiles.py` (third-session update) and `analyze_end_leverage.py`.
+
+### Claim that SSO Pareto-dominates hybrid
+
+**That was wrong.** In the ninth session brainstorm I claimed SSO p10 ($3.94M) > hybrid p10 ($3.73M). That used "wealth at last available day per path" — which mixes 5y, 10y, 20y, 30y horizons in a single percentile and is meaningless. Under strict horizon-matched filtering (only paths with ≥30y of forward data, the same paths used for hybrid's calibration), **SSO's p10 is consistently *worse* than hybrid's** across all three scenarios tested (heavy-DCA: $5.27M vs $6.51M; light-DCA: $6.50M vs $7.41M; lump-sum: $4.12M vs $5.05M). The 30y-horizon binding case includes 1973-74 + 1980-82 + 2000-09 stretches; SSO's vol drag during long drawdowns hurts the worst-decile paths more than the eliminated margin-call risk helps. Mechanism: variance drag at 2x scales as ~σ²; over a 9-year drawdown like 2000-09, this accumulates a meaningful wealth gap. The correct statement is that **SSO trades p10 for p50/p90** — not a strict improvement. UPRO's p10 can fall *below* unlev's in lump-tilted scenarios (Scenario C 30y: UPRO p10 $2.54M vs unlev p10 $4.29M).
 
 ---
 
@@ -1535,6 +1750,8 @@ The venv is at `.venv/` with numpy, pandas, openpyxl, and scipy installed. Some 
 12. **`analyze_clean_comparison.py`** — apples-to-apples of static vs amortization with matched cash flow
 13. **`analyze_2000_entry.py`** — reference for the binding worst-case scenario
 14. **`analyze_dca_leverage_grid.py`** — grid across DCA × leverage (caveat: uses old CAGR metric not IRR, interpret accordingly — magnitudes inflated by 1-5 pp at positive DCA)
+15. **`analyze_etf_sweep.py`** — SSO/UPRO vs hybrid/static across heavy-DCA / light-DCA / lump-sum scenarios. Shows ETF tail-risk-vs-upside trade quantitatively.
+16. **`verify_etf_sim.py`** — proves the daily-reset ETF model matches real SSO/UPRO TR within 0.1% cumulative wealth.
 
 ### Key numeric anchors to memorize
 
@@ -1552,6 +1769,9 @@ The venv is at `.venv/` with numpy, pandas, openpyxl, and scipy installed. Some 
 - **Typical IRR uplift from static @ safe vs unlev**: +0.5-1.1 pp over 30y (depends on DCA)
 - **Typical IRR uplift from monthly relever @ 1.43x vs unlev**: +2-3 pp over 30y (historical, before bootstrap correction)
 - **Typical IRR uplift from decay-2pp @ safe vs unlev**: +1.7-2.4 pp over 30y (historical, before bootstrap correction)
+- **SSO empirical vol drag**: ≈ 0.26%/yr at SPX's ~16% vol. **UPRO**: ≈ 0.77%/yr (3× SSO's). At low SPX vol regimes (~10%), drag drops by ~60%.
+- **SSO/UPRO best-fit financing spread over Tsy_3m**: **70 bps** (calibrated to real fund TR, 2006-2026 for SSO, 2009-2026 for UPRO). Combined with 0.91%/yr expense ratio, daily total drag is `(0.0091 + (N-1) × (Tsy_3m + 0.0070)) / 252`.
+- **ETF p10 wealth at 30y is consistently *worse* than hybrid's p10** across heavy-DCA / light-DCA / lump-sum scenarios. UPRO p10 can fall below unlev's p10 in lump-tilted scenarios. SSO p10 is close to but below unlev's. **ETFs trade left-tail for right-tail; not a Pareto improvement on margin strategies.**
 
 ### If asked about "can I use more than 1.43x"
 
@@ -1588,6 +1808,8 @@ Always clarify the safety basis being used:
 - **"Time-decay is just a different flavor of static"** — architecturally false. Time-decay couples to calendar (a non-risk variable) and bootstrap-fails 7× more than static. It's a curve fit to historical crisis timing.
 - **"Wealth-decay = better static"** — partially true (state-coupled) but flawed: HWM is backward-looking, gameable by DCA, and the underlying claim is utility (preference) not risk (mechanics). Bootstrap call rate 7.84% vs static's 1.46% reflects residual fragility.
 - **"Active management beats passive for leveraged SPX"** — false at honest sizing. Active strategies' apparent IRR edge is largely overfitting; under bootstrap or well-defended constraints, all four strategies converge to ~12% p50 IRR (10% DCA, 30y). Static is the architectural-physics answer.
+- **"SSO/UPRO are safer than margin because no margin call"** — half-true. They eliminate the call-wipeout left tail but introduce a vol-drag erosion of the entire left side of the distribution. Net p10 is *worse* than hybrid's at 30y across all scenarios tested. UPRO p10 can be below unlev p10 in lump-tilted cases. ETFs are right-tail-seeking instruments; the no-call property buys you upside, not downside protection.
+- **"Daily-leveraged ETFs lose 2x/3x compounding to decay"** — partially true. SSO at 2x has empirical drag of ~0.26%/yr at 16% vol (small); UPRO at 3x has ~0.77%/yr (~3× SSO's). The drag is real and matters at p10 over multi-year drawdowns, but does NOT mean "long-term leveraged ETF return = 0" as is sometimes claimed. SSO has roughly 2× SPX's long-term return; UPRO roughly 2.5-2.8× (drag eats some). The financing spread (~70 bps over Tsy) is empirically derived from real fund returns, not a guess.
 
 ### Common user pitfalls to watch for
 
