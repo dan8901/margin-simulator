@@ -12,6 +12,7 @@ is fast.
 
 import time
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -168,6 +169,32 @@ def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
         pl_p99 = (float(np.percentile(peak_h[~called_h], 99))
                   if (~called_h).any() else float("nan"))
 
+        # Per-year percentile bands (variable horizon: shorter years get
+        # more paths via avail filter; year 30 only sees full-horizon paths)
+        pct_by_year_h = {}
+        pct_by_year_b = {}
+        for y in range(1, horizon_yr + 1):
+            d = y * TD
+            if d > max_days:
+                break
+            eligible_y = avail_h >= d
+            vh = re_h[eligible_y, d]
+            vh = vh[~np.isnan(vh)]
+            if len(vh) > 0:
+                pp = np.percentile(vh, [10, 25, 50, 75, 90])
+                pct_by_year_h[y] = dict(
+                    p10=float(pp[0]), p25=float(pp[1]), p50=float(pp[2]),
+                    p75=float(pp[3]), p90=float(pp[4]),
+                    n=int(len(vh)))
+            vb = re_b[:, d]
+            vb = vb[~np.isnan(vb)]
+            if len(vb) > 0:
+                pp = np.percentile(vb, [10, 25, 50, 75, 90])
+                pct_by_year_b[y] = dict(
+                    p10=float(pp[0]), p25=float(pp[1]), p50=float(pp[2]),
+                    p75=float(pp[3]), p90=float(pp[4]),
+                    n=int(len(vb)))
+
         results.append(dict(
             label=f"{int(h*100):3d}/{int(ss*100):3d}/{int(u*100):3d}",
             h=h, s=ss, u=u, T=T, T_b=T_b, T_h=T_h, T_st=T_st,
@@ -180,6 +207,8 @@ def run_sweep(C, S, T_yrs, S2, wealth_X, horizon_yr, F, boot_target,
             p75_h=p75h, p90_h=p90h,
             p1_b=p1b, p5_b=p5b, p10_b=p10b, p25_b=p25b, p50_b=p50b,
             p75_b=p75b, p90_b=p90b,
+            pct_by_year_h=pct_by_year_h,
+            pct_by_year_b=pct_by_year_b,
         ))
 
     return results, T_solo_hybrid
@@ -449,3 +478,96 @@ if run_btn or st.session_state.get("mix_results") is not None:
         st.caption(f"Fraction of bootstrap paths ending below initial "
                    f"C=${scen['C']/1e3:.0f}k (%)")
         st.bar_chart(tail_df[["frac_below_C_pct"]], height=400)
+
+    # ------------------------------------------------------------------
+    # Multi-allocation comparison fan chart
+    # ------------------------------------------------------------------
+    st.subheader("Compare allocations: percentile bands over time")
+    st.caption(
+        "Wealth percentiles (p10/p25/p50/p75/p90) per year for up to 3 "
+        "allocations. Shorter years use more historical paths via "
+        "avail-bounded filter (year 5 has all post-1932 entries with ≥5y "
+        "forward data; year 30 only has those with ≥30y forward data — "
+        "see the 'n paths' tooltip). Toggle hist/boot below.")
+
+    default_picks = []
+    for r in results:
+        if r["label"] in pareto[:3]:
+            default_picks.append(r["label"])
+        if len(default_picks) >= 3:
+            break
+    if not default_picks:
+        default_picks = [r["label"] for r in results[:3]]
+
+    col_pick, col_src = st.columns([3, 1])
+    with col_pick:
+        cmp_allocs = st.multiselect(
+            "Allocations (max 3)",
+            options=[r["label"] for r in results],
+            default=default_picks,
+            max_selections=3,
+            key="mix_cmp_allocs")
+    with col_src:
+        cmp_source = st.radio(
+            "Path set", options=["historical", "bootstrap"],
+            index=0, key="mix_cmp_source",
+            help="Historical: real post-1932 paths, avail-bounded "
+                 "(more paths at shorter horizons). Bootstrap: 1y-block "
+                 "synthetic paths, full horizon for every year.")
+    log_y = st.checkbox("Log Y axis", value=True, key="mix_cmp_log")
+
+    if cmp_allocs:
+        rows = []
+        key = "pct_by_year_h" if cmp_source == "historical" else "pct_by_year_b"
+        for r in results:
+            if r["label"] not in cmp_allocs:
+                continue
+            for y, p in r[key].items():
+                rows.append(dict(
+                    alloc=r["label"], year=y,
+                    p10=p["p10"] / 1e6, p25=p["p25"] / 1e6,
+                    p50=p["p50"] / 1e6, p75=p["p75"] / 1e6,
+                    p90=p["p90"] / 1e6, n=p["n"]))
+        cmp_df = pd.DataFrame(rows)
+        if cmp_df.empty:
+            st.info("No data — pick at least one allocation.")
+        else:
+            y_scale = (alt.Scale(type="log") if log_y else alt.Scale())
+            base = alt.Chart(cmp_df).encode(
+                x=alt.X("year:Q", title="Year"))
+            band_p10_p90 = base.mark_area(opacity=0.15).encode(
+                y=alt.Y("p10:Q", scale=y_scale, title="Real wealth ($M)"),
+                y2=alt.Y2("p90:Q"),
+                color=alt.Color("alloc:N", title="Allocation"))
+            band_p25_p75 = base.mark_area(opacity=0.30).encode(
+                y=alt.Y("p25:Q", scale=y_scale),
+                y2=alt.Y2("p75:Q"),
+                color=alt.Color("alloc:N"))
+            line_p50 = base.mark_line(strokeWidth=2.5).encode(
+                y=alt.Y("p50:Q", scale=y_scale),
+                color=alt.Color("alloc:N"),
+                tooltip=["alloc:N", "year:Q", "p10:Q", "p25:Q", "p50:Q",
+                         "p75:Q", "p90:Q", "n:Q"])
+            chart = (band_p10_p90 + band_p25_p75 + line_p50).properties(
+                height=500).interactive()
+            st.altair_chart(chart, use_container_width=True)
+
+            # Side table — last 5 years, p50 for selected allocs
+            with st.expander("p50 trajectory table (selected allocations)"):
+                table_rows = []
+                for r in results:
+                    if r["label"] not in cmp_allocs:
+                        continue
+                    pct_dict = r[key]
+                    for y in sorted(pct_dict.keys()):
+                        p = pct_dict[y]
+                        table_rows.append(dict(
+                            alloc=r["label"], year=y,
+                            p10=f"${p['p10']/1e6:.2f}M",
+                            p25=f"${p['p25']/1e6:.2f}M",
+                            p50=f"${p['p50']/1e6:.2f}M",
+                            p75=f"${p['p75']/1e6:.2f}M",
+                            p90=f"${p['p90']/1e6:.2f}M",
+                            n_paths=p["n"]))
+                st.dataframe(pd.DataFrame(table_rows), hide_index=True,
+                             height=400)
