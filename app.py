@@ -1688,6 +1688,12 @@ if "results" in st.session_state:
 
     run_sweep = st.button("Run T sweep", key="t_sweep_run")
 
+    sweep_params_ok = "max_days" in p and "paths" in res and "paths_key" in res
+    if run_sweep and not sweep_params_ok:
+        st.warning("Stale session state — click sidebar 'Run / refresh' first "
+                   "to repopulate the parameters needed by this chart.")
+        run_sweep = False
+
     if run_sweep:
         with st.spinner("Running T sweep (1–5 minutes for fresh results; "
                         "cached for re-renders)..."):
